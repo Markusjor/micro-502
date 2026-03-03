@@ -15,7 +15,6 @@ import time, random
 import threading
 
 exp_num = 4                    # 0: Coordinate Transformation, 1: PID Tuning, 2: Kalman Filter, 3: Motion Planning, 4: Project
-
 control_style = 'keyboard'     # 'keyboard' or 'path_planner'
 rand_env = True                # Randomise the environment
 
