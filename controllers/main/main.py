@@ -15,8 +15,8 @@ import time, random
 import threading
 
 exp_num = 4                    # 0: Coordinate Transformation, 1: PID Tuning, 2: Kalman Filter, 3: Motion Planning, 4: Project
-control_style = 'keyboard'     # 'keyboard' or 'path_planner'
-rand_env = True                # Randomise the environment
+control_style = 'path_planner'  # 'keyboard' or 'path_planner'
+rand_env = False                # Randomise the environment
 
 # Global variables for handling threads
 latest_sensor_data = None
@@ -542,6 +542,7 @@ class CrazyflieInDroneDome(Supervisor):
         # Convert the image to a numpy array for OpenCV
         image = np.frombuffer(camera_image, np.uint8).reshape((self.camera.getHeight(), self.camera.getWidth(), 4))
 
+
         return image
     
     # Detect which segment the drone is in
@@ -671,6 +672,15 @@ if __name__ == '__main__':
     assert control_style in ['keyboard','path_planner'], "Variable control_style must either be 'keyboard' or 'path_planner'"
     assert exp_num in [0,1,2,3,4], "Exp_num must be a value between 0 and 4"
 
+    # Print ground-truth gate positions so they are visible in the Webots console
+    if exp_num == 4:
+        print("\n" + "=" * 50)
+        print("GROUND TRUTH GATE POSITIONS")
+        print("=" * 50)
+        for i, pos in enumerate(drone.gate_positions):
+            print(f"  Gate {i + 1}: x={pos[0]:.3f}  y={pos[1]:.3f}  z={pos[2]:.3f}")
+        print("=" * 50 + "\n")
+
     # Start the path planner thread
     if control_style == 'path_planner' and exp_num == 4:
         planner_thread = threading.Thread(target=path_planner_thread, args=(drone,))
@@ -694,6 +704,11 @@ if __name__ == '__main__':
             if drone.PID_update_last_time == 0.0 or np.round(drone.dt_ctrl,3) >= drone.ctrl_update_period/1000: #Only execute at first point and in control rate step
 
                 if control_style == 'keyboard':
+                    # Run gate detection during manual flight (assignment world only)
+                    if exp_num == 4:
+                        camera_data = drone.read_camera()
+                        assignment.get_command(sensor_data, camera_data, drone.dt_ctrl)
+
                     # Get the control commands from the keyboard
                     control_commands = drone.action_from_keyboard(sensor_data)
                     
@@ -750,7 +765,7 @@ if __name__ == '__main__':
     
     except KeyboardInterrupt:
         running = False
-        planner_thread.join()
-
+        if control_style == 'path_planner' and exp_num == 4:
+            planner_thread.join()
 
 

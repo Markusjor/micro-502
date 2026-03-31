@@ -21,7 +21,7 @@ class quadrotor_controller():
         #             "P_rate_y": 0.02,   "I_rate_y": 0.0,    "D_rate_y": 0.001
         #             }
         
-        if exp_num == 2 or exp_num == 3:
+        if exp_num == 2 or exp_num == 3 or exp_num == 4:
             # KF gains and limits
             
             gains = {
