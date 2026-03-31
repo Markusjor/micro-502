@@ -54,7 +54,9 @@ HSV_LO1 = np.array([140,  50,  30])
 HSV_HI1 = np.array([179, 255, 255])
 HSV_LO2 = np.array([  0,  50,  30])
 HSV_HI2 = np.array([ 10, 255, 255])
-BORDER       = 8     # px – strip camera frame before detection
+BORDER           = 8    # px – strip camera frame before detection
+FULL_PANEL_MARGIN = 20  # px – reject obs if bounding box is this close to edge
+                        #      (partial panel biases centroid → wrong bearing)
 MIN_AREA     = 250   # px² – rejects small noise/sign blobs
 MIN_SOLIDITY = 0.55  # slightly relaxed so semi-transparent panels still pass
 MAX_ASPECT   = 1.6   # gate panel is ~square (0.4×0.4 m); rejects wide signs
@@ -76,7 +78,7 @@ BEARING_TOL   = 0.30  # rad – angular match tolerance for bearing-only match
 # Low value means gates are confirmed quickly from depth-from-panel-size alone,
 # giving an approximate position that gets refined once the drone moves.
 FALLBACK_OBS           = 3
-MAX_RAYS_PER_CANDIDATE = 60
+MAX_RAYS_PER_CANDIDATE = 200  # keep plenty for post-lap batch refinement
 MAX_CANDIDATES         = 25
 
 ARENA_XMIN, ARENA_XMAX = 0.0, 9.0
@@ -151,18 +153,40 @@ def detect_gate_corners(bgr_image):
 # ---------------------------------------------------------------------------
 # Triangulation helpers
 # ---------------------------------------------------------------------------
-def triangulate_rays(origins, directions, depths=None):
+# ---------------------------------------------------------------------------
+# Kalman / MAP position estimator
+# ---------------------------------------------------------------------------
+P_INIT = 25.0   # initial position variance per axis (std ≈ 5 m – very uncertain)
+
+def _kalman_update(pos, cov, meas, noise_var):
+    """
+    Bayesian (Kalman) position update for a static target.
+
+    pos, meas : (3,) arrays  — current estimate and new measurement
+    cov       : (3,3) array  — current covariance
+    noise_var : scalar       — isotropic measurement noise variance
+
+    Returns updated (pos, cov).  Higher noise_var → smaller correction.
+    """
+    R = noise_var * np.eye(3)
+    S = cov + R
+    K = cov @ np.linalg.solve(S, np.eye(3))   # Kalman gain  (3×3)
+    pos_new = pos + K @ (meas - pos)
+    cov_new = (np.eye(3) - K) @ cov
+    return pos_new, cov_new
+
+
+def triangulate_rays(origins, directions, weights=None):
     """
     Weighted least-squares ray intersection.
 
-    Weight = 1/depth² so closer observations (lower depth estimation noise)
-    contribute more than distant ones.
+    weights: per-ray confidence (face_conf / depth²). Higher = more trusted.
     """
     A = np.zeros((3, 3))
     b = np.zeros(3)
     for i, (p, d) in enumerate(zip(origins, directions)):
         d  = d / np.linalg.norm(d)
-        w  = 1.0 / max(depths[i], 0.3) ** 2 if depths is not None else 1.0
+        w  = float(weights[i]) if weights is not None else 1.0
         M  = np.eye(3) - np.outer(d, d)
         A += w * M
         b += w * (M @ p)
@@ -224,6 +248,15 @@ class MyAssignment:
     # Observation extraction
     # -----------------------------------------------------------------
     def _corners_to_obs(self, corners, sensor_data):
+        # Reject if the bounding box is cut off by the frame edge.
+        # A partial panel biases cx/cy away from the true centre, corrupting
+        # both the bearing direction and the pixel_h depth estimate.
+        if (corners[:, 0].min() < FULL_PANEL_MARGIN or
+                corners[:, 0].max() > IMG_W - FULL_PANEL_MARGIN or
+                corners[:, 1].min() < FULL_PANEL_MARGIN or
+                corners[:, 1].max() > IMG_H - FULL_PANEL_MARGIN):
+            return None
+
         cx = float(np.mean(corners[:, 0]))
         cy = float(np.mean(corners[:, 1]))
 
@@ -239,14 +272,23 @@ class MyAssignment:
         y_n = (cy - IMG_H / 2) / F_PX
 
         # Ray in camera/body frame: forward=X, right=-Y, up=Z
-        # Pixel right (+x_n) → body -Y; pixel down (+y_n) → body -Z
         d_body = np.array([1.0, -x_n, -y_n])
 
-        # Correct for off-centre projection: depth_fwd is the component along
-        # the optical axis (body X), not the 3-D ray distance.
-        # 3-D distance = depth_fwd * |d_body|  (since d_body[0] = 1)
+        # Correct for off-centre projection: depth_fwd is Z_camera only.
         ray_scale = float(np.linalg.norm(d_body))   # sqrt(1 + x_n² + y_n²)
         depth_3d  = depth_fwd * ray_scale
+
+        # Face-on confidence: the gate panel is ~square (0.4 × 0.4 m).
+        # boxPoints gives a rotated rectangle; its minor/major pixel ratio
+        # estimates how face-on the view is (1 = square = face-on, 0 = edge-on).
+        edge0      = float(np.linalg.norm(corners[1] - corners[0]))
+        edge1      = float(np.linalg.norm(corners[2] - corners[1]))
+        face_conf  = min(edge0, edge1) / max(edge0, edge1 + 1e-6)
+
+        # Combined observation weight: face-on AND close observations carry more
+        # information. Weight = face_conf / depth² matches Fisher information
+        # for bearing measurements with depth-independent angular noise.
+        obs_weight = face_conf / max(depth_3d, 0.3) ** 2
 
         # Full rotation R = Rz(yaw) * Ry(pitch) * Rx(roll)
         roll  = sensor_data['roll']
@@ -266,19 +308,22 @@ class MyAssignment:
         origin = np.array([sensor_data['x_global'],
                            sensor_data['y_global'],
                            sensor_data['z_global']])
-        return origin, d, depth_3d
+        return origin, d, depth_3d, obs_weight
 
     # -----------------------------------------------------------------
     # Candidate helpers
     # -----------------------------------------------------------------
-    def _new_candidate(self, origin, direction, depth_est, frame, corners):
-        pos_est = origin + depth_est * direction
+    def _new_candidate(self, origin, direction, depth_3d, obs_weight, frame, corners):
+        pos_est   = origin + depth_3d * direction
+        noise_var = 1.0 / max(obs_weight, 1e-6)
         return {
             'origins':      [origin.copy()],
             'directions':   [direction.copy()],
-            'depths':       [depth_est],
+            'depths':       [depth_3d],
+            'obs_weights':  [obs_weight],       # per-ray weights (aligned to origins)
             'pos':          pos_est.copy(),
-            'best_residual': float('inf'),   # best residual seen so far
+            'cov':          noise_var * np.eye(3),  # Kalman covariance (init = 1st meas noise)
+            'best_residual': float('inf'),
             'triangulated': False,
             'confirmed':    False,
             'gate_idx':     None,
@@ -286,8 +331,8 @@ class MyAssignment:
             'last_corners': corners.copy(),
         }
 
-    def _match(self, origin, direction, depth_est):
-        pos_est = origin + depth_est * direction
+    def _match(self, origin, direction, depth_3d):
+        pos_est = origin + depth_3d * direction
         for i, c in enumerate(self.candidates):
             if np.linalg.norm(pos_est[:2] - c['pos'][:2]) < DEDUP_RADIUS:
                 return i
@@ -302,12 +347,19 @@ class MyAssignment:
                         return i
         return -1
 
-    def _add_ray(self, cand, origin, direction, depth_est, frame, corners):
+    def _add_ray(self, cand, origin, direction, depth_3d, obs_weight, frame, corners):
         cand['last_frame']   = frame.copy()
         cand['last_corners'] = corners.copy()
 
-        # Always collect depth estimates – these power the stationary fallback.
-        cand['depths'].append(depth_est)
+        # --- Kalman update from this single-point estimate ---
+        # Every observation (including stationary) refines the MAP position.
+        # noise_var = 1/obs_weight  (far / edge-on → high noise → small correction)
+        new_pt    = origin + depth_3d * direction
+        noise_var = 1.0 / max(obs_weight, 1e-6)
+        cand['pos'], cand['cov'] = _kalman_update(
+            cand['pos'], cand['cov'], new_pt, noise_var)
+
+        cand['depths'].append(depth_3d)
 
         # Only store a new ray origin when the drone has moved enough.
         stationary = any(np.linalg.norm(origin[:2] - prev[:2]) < 0.05
@@ -315,44 +367,42 @@ class MyAssignment:
         if not stationary:
             cand['origins'].append(origin.copy())
             cand['directions'].append(direction.copy())
+            cand['obs_weights'].append(obs_weight)
             if len(cand['origins']) > MAX_RAYS_PER_CANDIDATE:
                 cand['origins'].pop(0)
                 cand['directions'].pop(0)
+                cand['obs_weights'].pop(0)
 
         if len(cand['depths']) > MAX_RAYS_PER_CANDIDATE:
             cand['depths'].pop(0)
 
-        # Primary: triangulation from spatially diverse rays
+        # --- Additional Kalman update from weighted triangulation ---
+        # Triangulation uses geometric ray intersection across diverse positions:
+        # its accuracy (≈ residual) is much better than individual point estimates,
+        # so we feed it into the Kalman filter with noise = residual².
         if len(cand['origins']) >= 2:
             origs    = np.array(cand['origins'])
             baseline = float(np.max(np.linalg.norm(
                 origs[:, :2] - origs[:1, :2], axis=1)))
             if baseline >= MIN_BASELINE:
-                pos, cond = triangulate_rays(cand['origins'], cand['directions'],
-                                             cand['depths'][:len(cand['origins'])])
-                if pos is not None and cond <= MAX_COND:
-                    new_res = ray_residual(cand['origins'], cand['directions'], pos)
-                    if new_res < cand['best_residual']:
-                        cand['pos']           = pos
-                        cand['best_residual'] = new_res
-                        cand['triangulated']  = True
-                        return True
+                pos_tri, cond = triangulate_rays(cand['origins'], cand['directions'],
+                                                 cand['obs_weights'])
+                if pos_tri is not None and cond <= MAX_COND:
+                    res = ray_residual(cand['origins'], cand['directions'], pos_tri)
+                    # Feed the triangulation result as a high-accuracy measurement.
+                    tri_noise = max(res, 0.02) ** 2
+                    cand['pos'], cand['cov'] = _kalman_update(
+                        cand['pos'], cand['cov'], pos_tri, tri_noise)
+                    cand['best_residual'] = min(cand['best_residual'], res)
+                    cand['triangulated']  = True
+                    return True
 
-        # Fallback: weighted depth mean from repeated observations at same position.
-        # Uses only stored rays (may be just 1) paired with all depth estimates.
+        # --- Fallback: enough single-point Kalman steps have accumulated ---
         if len(cand['depths']) >= FALLBACK_OBS:
-            depths  = np.array(cand['depths'])
-            weights = 1.0 / np.maximum(depths, 0.3)
-            # Repeat the single/first origin+direction for all depth samples
-            o0, d0  = cand['origins'][0], cand['directions'][0]
-            pts     = np.array([o0 + d0 * z for z in depths])
-            pos     = np.average(pts, axis=0, weights=weights)
-            new_res = ray_residual(cand['origins'], cand['directions'], pos)
-            if new_res < cand['best_residual']:
-                cand['pos']           = pos
-                cand['best_residual'] = new_res
-                cand['triangulated']  = True
-                return True
+            res = ray_residual(cand['origins'], cand['directions'], cand['pos'])
+            cand['best_residual'] = min(cand['best_residual'], res)
+            cand['triangulated']  = True
+            return True
 
         return False
 
@@ -409,18 +459,18 @@ class MyAssignment:
     # -----------------------------------------------------------------
     # Observation pipeline
     # -----------------------------------------------------------------
-    def _process_observation(self, origin, direction, depth_est, frame, corners):
-        idx = self._match(origin, direction, depth_est)
+    def _process_observation(self, origin, direction, depth_3d, obs_weight, frame, corners):
+        idx = self._match(origin, direction, depth_3d)
 
         if idx < 0:
             if len(self.candidates) >= MAX_CANDIDATES:
                 return
             self.candidates.append(
-                self._new_candidate(origin, direction, depth_est, frame, corners))
+                self._new_candidate(origin, direction, depth_3d, obs_weight, frame, corners))
             return
 
         updated = self._add_ray(self.candidates[idx], origin, direction,
-                                depth_est, frame, corners)
+                                depth_3d, obs_weight, frame, corners)
         if updated:
             self._try_confirm(self.candidates[idx])
 
@@ -444,7 +494,7 @@ class MyAssignment:
         return best_idx
 
     def _plan_to_gate(self, gate_idx, drone_xyz):
-        """Build a 4-waypoint min-jerk trajectory: start → approach → centre → past."""
+        """Direct trajectory: start → approach → centre → past."""
         cand     = self._gate_candidate(gate_idx)
         gate_pos = cand['pos']
         drone_xy = drone_xyz[:2]
@@ -455,9 +505,13 @@ class MyAssignment:
         past     = gate_pos[:2] + fwd * PAST_DIST
         z        = float(gate_pos[2])
 
+        for pt in (ap, past):
+            pt[0] = float(np.clip(pt[0], ARENA_XMIN + 0.5, ARENA_XMAX - 0.5))
+            pt[1] = float(np.clip(pt[1], ARENA_YMIN + 0.5, ARENA_YMAX - 0.5))
+
         waypoints = [
             drone_xyz.tolist(),
-            [float(ap[0]), float(ap[1]), z],
+            [float(ap[0]),       float(ap[1]),       z],
             [float(gate_pos[0]), float(gate_pos[1]), z],
             [float(past[0]),     float(past[1]),     z],
         ]
@@ -465,7 +519,7 @@ class MyAssignment:
         self._traj            = traj
         self._traj_idx        = 0
         self._target_gate     = gate_idx
-        self._centre_traj_idx = len(traj) - 1   # drone must reach past-gate point
+        self._centre_traj_idx = len(traj) - 1
         print(f"[Nav] Trajectory to gate {gate_idx}: {len(traj)} pts, "
               f"gate @ ({gate_pos[0]:.2f}, {gate_pos[1]:.2f}, {gate_pos[2]:.2f})")
 
@@ -546,6 +600,47 @@ class MyAssignment:
             pts.append([x, y, z])
         return np.array(pts)
 
+    # -----------------------------------------------------------------
+    # Post-lap batch refinement
+    # -----------------------------------------------------------------
+    def _refine_all_gates(self):
+        """
+        Batch re-estimation of all confirmed gate positions using every
+        observation accumulated during the lap.
+
+        Called once after the last gate is passed.  By then each candidate
+        has many diverse rays (from the approach, SEARCH rotation, and any
+        incidental views), so the weighted triangulation is far more accurate
+        than the online Kalman estimate.
+        """
+        print("[GateMap] Running post-lap batch refinement …")
+        for cand in self.candidates:
+            if not cand['confirmed'] or len(cand['origins']) < 2:
+                continue
+            origs    = np.array(cand['origins'])
+            baseline = float(np.max(np.linalg.norm(
+                origs[:, :2] - origs[:1, :2], axis=1)))
+            if baseline < MIN_BASELINE:
+                continue
+            pos_tri, cond = triangulate_rays(cand['origins'], cand['directions'],
+                                             cand['obs_weights'])
+            if pos_tri is None or cond > MAX_COND:
+                continue
+            if not (ARENA_XMIN < pos_tri[0] < ARENA_XMAX and
+                    ARENA_YMIN < pos_tri[1] < ARENA_YMAX and
+                    ARENA_ZMIN < pos_tri[2] < ARENA_ZMAX):
+                continue
+            res = ray_residual(cand['origins'], cand['directions'], pos_tri)
+            old = cand['pos']
+            cand['pos'] = pos_tri
+            print(f"  Gate {cand['gate_idx']:d}: "
+                  f"({old[0]:.3f},{old[1]:.3f},{old[2]:.3f}) → "
+                  f"({pos_tri[0]:.3f},{pos_tri[1]:.3f},{pos_tri[2]:.3f})  "
+                  f"res={res:.3f}m  n={len(cand['origins'])}  "
+                  f"baseline={baseline:.2f}m")
+        _save_gate_map(self.gate_map)
+        print("[GateMap] Refinement complete.")
+
     def _navigate(self, sensor_data):
         x   = sensor_data['x_global']
         y   = sensor_data['y_global']
@@ -571,6 +666,7 @@ class MyAssignment:
                 if len(self._gates_passed) >= NUM_GATES:
                     self._nav_state = self._S_DONE
                     print("[Nav] All gates passed!")
+                    self._refine_all_gates()
                     return [x, y, CRUISE_Z, sensor_data['yaw']]
                 # Hover here and rotate to search for the next gate
                 self._nav_state   = self._S_SEARCH
@@ -601,15 +697,9 @@ class MyAssignment:
                 self._nav_state = self._S_APPROACH
                 # Fall through to APPROACH handler below
             else:
-                wp    = EXPLORE_WAYPOINTS[self._explore_wp % len(EXPLORE_WAYPOINTS)]
-                wp_xy = np.array(wp[:2])
-                if float(np.linalg.norm(wp_xy - drone_xy)) < EXPLORE_WP_THRESH:
-                    self._explore_wp += 1
-                    wp    = EXPLORE_WAYPOINTS[self._explore_wp % len(EXPLORE_WAYPOINTS)]
-                    wp_xy = np.array(wp[:2])
-                to_wp = wp_xy - drone_xy
-                tyaw  = float(np.arctan2(to_wp[1], to_wp[0]))
-                return [float(wp_xy[0]), float(wp_xy[1]), float(wp[2]), tyaw]
+                # Hold position at cruise altitude; camera will detect the first
+                # gate once it is fully in frame. No rotation needed at startup.
+                return [x, y, CRUISE_Z, sensor_data['yaw']]
 
         # ----------------------------------------------------------------
         # APPROACH – follow min-jerk trajectory setpoints
