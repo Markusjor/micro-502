@@ -184,6 +184,14 @@ class CrazyflieInDroneDome(Supervisor):
                 self.gate_sizes.append(goal_node.getField('goalSize').getSFVec3f())
                 self.gate_orientations.append(goal_node.getField('rotation').getSFRotation())
 
+            # Write ground truth so my_assignment.py can include it in comparisons
+            import os, json
+            _project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+            with open(os.path.join(_project_dir, 'gate_truth.json'), 'w') as _f:
+                json.dump([{'x': p[0], 'y': p[1], 'z': p[2]}
+                           for p in self.gate_positions], _f, indent=2)
+            print("[Truth] gate_truth.json written")
+
     # Randomise the positions of the drone, obstacles, goal, take-off pad and landing pad
     def randomise_positions(self):
                                
@@ -696,14 +704,19 @@ if __name__ == '__main__':
                 if control_style == 'keyboard':
                     # Get the control commands from the keyboard
                     control_commands = drone.action_from_keyboard(sensor_data)
-                    
+
                     # Rotate the control commands from the body reference frame to the inertial reference frame
                     euler_angles = [sensor_data['roll'], sensor_data['pitch'], sensor_data['yaw']]
                     quaternion = [sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
                     control_commands = ex0_rotations.rot_inertial2body(control_commands, euler_angles, quaternion)
 
                     # Call the PID controller to get the motor commands
-                    motorPower = drone.PID_CF.keys_to_pwm(drone.dt_ctrl, control_commands, sensor_data)    
+                    motorPower = drone.PID_CF.keys_to_pwm(drone.dt_ctrl, control_commands, sensor_data)
+
+                    # For the assignment, also run gate detection from the camera feed
+                    if exp_num == 4:
+                        camera_data = drone.read_camera()
+                        assignment.get_command(sensor_data, camera_data, drone.dt_ctrl)
 
                 elif control_style == 'path_planner':
                     # # Update the setpoint
