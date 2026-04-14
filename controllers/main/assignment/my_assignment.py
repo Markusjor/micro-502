@@ -57,6 +57,22 @@ _SAVE_DEDUP_RADIUS  = 1.5   # m – gates are ≥2 m apart; increased to avoid r
 _FULL_PANEL_MARGIN  = 20   # px – reject if bounding box touches frame edge (partial panels give bad PnP)
 NUM_GATES          = 5
 
+# ---------------------------------------------------------------------------
+# Navigation
+# ---------------------------------------------------------------------------
+CRUISE_Z         = 1.0   # m – default flight altitude
+APPROACH_DIST    = 1.5   # m – approach waypoint in front of gate centre
+PAST_DIST        = 1.2   # m – how far past the gate centre before switching to SEARCH
+TRAJ_STEP_THRESH = 0.15  # m – advance to next trajectory setpoint when within this distance
+T_SEG            = 2.5   # s – time budget per waypoint-to-waypoint segment
+DISC_STEPS       = 20    # trajectory points per segment
+SEARCH_YAW_RATE  = 0.04  # rad per control step while rotating to find next gate
+
+# Arena bounds for trajectory clipping
+ARENA_XMIN, ARENA_XMAX = 0.0, 9.0
+ARENA_YMIN, ARENA_YMAX = 0.0, 9.0
+
+
 
 # ---------------------------------------------------------------------------
 # Detection
@@ -228,27 +244,40 @@ def _estimate_position(observations):
 # Controller
 # ---------------------------------------------------------------------------
 class MyAssignment:
+
+    # State machine constants
+    _S_APPROACH = 'approach'
+    _S_SEARCH   = 'search'
+    _S_DONE     = 'done'
+
     def __init__(self):
-        # Each entry: {'observations': [(pos, area), ...], 'pos': np.array, 'best_area': float}
+        # Detection – one entry per gate:
+        #   {'observations': [(world_pos, area), ...], 'pos': np.array, 'best_area': float}
         self._gates = []
 
+        # Navigation state machine
+        self._nav_state       = self._S_SEARCH
+        self._gates_passed    = set()
+        self._traj            = None   # (N, 3) discretised trajectory
+        self._traj_idx        = 0
+        self._target_gate     = None   # index into self._gates
+        self._centre_traj_idx = None   # traj index where gate is considered passed
+        self._search_yaw      = 0.0
+
+    # ------------------------------------------------------------------
+    # Detection
+    # ------------------------------------------------------------------
+
     def _match_gate(self, world_pos):
-        """Return index into _gates if world_pos is within dedup radius, else -1."""
         for i, g in enumerate(self._gates):
             if np.linalg.norm(world_pos[:2] - g['pos'][:2]) < _SAVE_DEDUP_RADIUS:
                 return i
         return -1
 
-    def compute_command(self, sensor_data, camera_data, dt):
-        if sensor_data['z_global'] < 0.49:
-            return [sensor_data['x_global'], sensor_data['y_global'],
-                    1.0, sensor_data['yaw']]
-
-        bgr        = cv2.cvtColor(camera_data, cv2.COLOR_BGRA2BGR)
+    def _update_detections(self, bgr, sensor_data):
+        """Run detection on bgr and update the gate registry."""
         detections = detect_gate_corners(bgr)
-
         for corners in detections:
-            # Skip partial panels – bounding box cut by frame edge makes PnP unreliable
             if (corners[:, 0].min() < _FULL_PANEL_MARGIN or
                     corners[:, 0].max() > IMG_W - _FULL_PANEL_MARGIN or
                     corners[:, 1].min() < _FULL_PANEL_MARGIN or
@@ -260,16 +289,14 @@ class MyAssignment:
                 continue
 
             area = float(cv2.contourArea(corners))
+            idx  = self._match_gate(world_pos)
 
-            idx = self._match_gate(world_pos)
             if idx < 0:
-                # New gate – register only if we haven't found all 5 yet
                 if len(self._gates) >= NUM_GATES:
                     continue
                 self._gates.append({'observations': [(world_pos.copy(), area)],
                                     'pos': world_pos.copy(),
                                     'best_area': area})
-                idx      = len(self._gates) - 1
                 gate_num = len(self._gates)
                 self._save_image(bgr, corners, world_pos, gate_num)
                 print(f"[Gate {gate_num}] first detection  "
@@ -278,7 +305,6 @@ class MyAssignment:
                 if gate_num == NUM_GATES:
                     _save_results(self._gates)
             else:
-                # Known gate – append observation and recompute robust estimate
                 g = self._gates[idx]
                 g['observations'].append((world_pos.copy(), area))
                 g['pos'] = _estimate_position(g['observations'])
@@ -287,16 +313,170 @@ class MyAssignment:
                 print(f"[Gate {gate_num}] updated ({n_obs} obs)  "
                       f"pos=({g['pos'][0]:.2f},{g['pos'][1]:.2f},{g['pos'][2]:.2f})  "
                       f"area={area:.0f}px²")
-                # Overwrite image if this is a closer (larger area) view
                 if area > g['best_area']:
                     g['best_area'] = area
                     self._save_image(bgr, corners, g['pos'], gate_num)
-                # Rewrite results whenever any estimate changes
                 if len(self._gates) == NUM_GATES:
                     _save_results(self._gates)
 
-        return [sensor_data['x_global'], sensor_data['y_global'],
-                1.0, sensor_data['yaw']]
+    # ------------------------------------------------------------------
+    # Navigation helpers
+    # ------------------------------------------------------------------
+
+    def _nearest_unvisited(self, drone_xy):
+        """Return the index of the nearest known gate not yet passed, or None."""
+        best_idx  = None
+        best_dist = float('inf')
+        for i, g in enumerate(self._gates):
+            if i in self._gates_passed:
+                continue
+            d = float(np.linalg.norm(drone_xy - g['pos'][:2]))
+            if d < best_dist:
+                best_dist = d
+                best_idx  = i
+        return best_idx
+
+    def _poly_matrix(self, t):
+        """6×6 constraint matrix for a 5th-order polynomial segment of duration t."""
+        T = float(t)
+        return np.array([
+            [1,  0,    0,      0,       0,        0      ],  # p(0)
+            [0,  1,    0,      0,       0,        0      ],  # p'(0)
+            [0,  0,    2,      0,       0,        0      ],  # p''(0)
+            [1,  T,    T**2,   T**3,    T**4,     T**5   ],  # p(T)
+            [0,  1,    2*T,    3*T**2,  4*T**3,   5*T**4 ],  # p'(T)
+            [0,  0,    2,      6*T,    12*T**2,  20*T**3 ],  # p''(T)
+        ])
+
+    def _min_jerk_trajectory(self, waypoints):
+        """
+        Build a minimum-jerk trajectory through *waypoints* (list of [x,y,z]).
+        Each segment uses a 5th-order polynomial with zero velocity and
+        acceleration at both endpoints.
+
+        Returns an (N, 3) ndarray of discretised positions.
+        """
+        M   = self._poly_matrix(T_SEG)
+        pts = []
+        n   = len(waypoints)
+
+        for i in range(n - 1):
+            p0 = np.array(waypoints[i][:3],   dtype=float)
+            p1 = np.array(waypoints[i + 1][:3], dtype=float)
+            # include endpoint only for the last segment to avoid duplicates
+            last_seg = (i == n - 2)
+            ts = np.linspace(0.0, T_SEG, DISC_STEPS, endpoint=last_seg)
+
+            seg = np.zeros((len(ts), 3))
+            for dim in range(3):
+                b = np.array([p0[dim], 0.0, 0.0, p1[dim], 0.0, 0.0])
+                c = np.linalg.solve(M, b)
+                for j, t in enumerate(ts):
+                    seg[j, dim] = (c[0] + c[1]*t + c[2]*t**2
+                                   + c[3]*t**3 + c[4]*t**4 + c[5]*t**5)
+            pts.append(seg)
+
+        return np.vstack(pts)
+
+    def _plan_to_gate(self, gate_idx, drone_xyz):
+        """Build and store a min-jerk trajectory toward gate *gate_idx*."""
+        gate_pos = self._gates[gate_idx]['pos']
+        z = float(gate_pos[2]) if not np.isnan(float(gate_pos[2])) else CRUISE_Z
+
+        to_gate = gate_pos[:2] - drone_xyz[:2]
+        dist    = float(np.linalg.norm(to_gate))
+        d_hat   = to_gate / dist if dist > 0.1 else np.array([1.0, 0.0])
+
+        ap   = gate_pos[:2] - d_hat * APPROACH_DIST   # approach point
+        past = gate_pos[:2] + d_hat * PAST_DIST        # pull-through point
+
+        waypoints = [
+            [drone_xyz[0], drone_xyz[1], drone_xyz[2]],
+            [ap[0],        ap[1],        z            ],
+            [gate_pos[0],  gate_pos[1],  z            ],
+            [past[0],      past[1],      z            ],
+        ]
+
+        traj = self._min_jerk_trajectory(waypoints)
+        self._traj            = traj
+        self._traj_idx        = 0
+        # Gate is considered passed once we reach the end of the trajectory
+        # (which is PAST_DIST beyond the gate centre).
+        self._centre_traj_idx = len(traj) - 1
+
+    # ------------------------------------------------------------------
+    # Navigation state machine
+    # ------------------------------------------------------------------
+
+    def _navigate(self, sensor_data):
+        drone_xyz = np.array([sensor_data['x_global'],
+                              sensor_data['y_global'],
+                              sensor_data['z_global']])
+        drone_xy  = drone_xyz[:2]
+        yaw       = float(sensor_data['yaw'])
+
+        # ── DONE ──────────────────────────────────────────────────────────
+        if self._nav_state == self._S_DONE:
+            return [drone_xyz[0], drone_xyz[1], CRUISE_Z, yaw]
+
+        # ── APPROACH: follow trajectory, check if gate is passed ──────────
+        if self._nav_state == self._S_APPROACH and self._traj is not None:
+            pt   = self._traj[self._traj_idx]
+            dist = float(np.linalg.norm(drone_xyz - pt))
+            if dist < TRAJ_STEP_THRESH and self._traj_idx < len(self._traj) - 1:
+                self._traj_idx += 1
+
+            if self._traj_idx >= self._centre_traj_idx:
+                # Gate passed
+                self._gates_passed.add(self._target_gate)
+                print(f"[Nav] gate {self._target_gate + 1} passed "
+                      f"({len(self._gates_passed)}/{NUM_GATES})")
+                if len(self._gates_passed) >= NUM_GATES:
+                    self._nav_state = self._S_DONE
+                    print("[Nav] all gates passed → DONE")
+                    return [drone_xyz[0], drone_xyz[1], CRUISE_Z, yaw]
+                self._nav_state = self._S_SEARCH
+                self._search_yaw = yaw
+                print("[Nav] → SEARCH")
+                # fall through to SEARCH below
+            else:
+                pt = self._traj[self._traj_idx]
+                if self._traj_idx < len(self._traj) - 1:
+                    nxt = self._traj[self._traj_idx + 1]
+                    dx, dy = nxt[0] - pt[0], nxt[1] - pt[1]
+                    if abs(dx) + abs(dy) > 0.01:
+                        yaw = float(np.arctan2(dy, dx))
+                return [float(pt[0]), float(pt[1]), float(pt[2]), yaw]
+
+        # ── SEARCH: rotate until a gate is visible, then approach ─────────
+        if self._nav_state == self._S_SEARCH:
+            next_gate = self._nearest_unvisited(drone_xy)
+            if next_gate is not None:
+                self._target_gate = next_gate
+                self._plan_to_gate(next_gate, drone_xyz)
+                self._nav_state = self._S_APPROACH
+                print(f"[Nav] target gate {next_gate + 1} → APPROACH")
+                pt = self._traj[0]
+                return [float(pt[0]), float(pt[1]), float(pt[2]), yaw]
+            # No gate known yet – rotate in place
+            self._search_yaw += SEARCH_YAW_RATE
+            return [drone_xyz[0], drone_xyz[1], CRUISE_Z, self._search_yaw]
+
+        # Fallback
+        return [drone_xyz[0], drone_xyz[1], CRUISE_Z, yaw]
+
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
+
+    def compute_command(self, sensor_data, camera_data, _dt):
+        if sensor_data['z_global'] < 0.49:
+            return [sensor_data['x_global'], sensor_data['y_global'],
+                    1.0, sensor_data['yaw']]
+
+        bgr = cv2.cvtColor(camera_data, cv2.COLOR_BGRA2BGR)
+        self._update_detections(bgr, sensor_data)
+        return self._navigate(sensor_data)
 
     @staticmethod
     def _save_image(bgr, corners, world_pos, gate_num):
