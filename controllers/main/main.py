@@ -17,6 +17,8 @@ import threading
 exp_num = 4                    # 0: Coordinate Transformation, 1: PID Tuning, 2: Kalman Filter, 3: Motion Planning, 4: Project
 control_style = 'path_planner'     # 'keyboard' or 'path_planner'
 rand_env = True                # Randomise the environment
+rand_seed = 1302036090                # None = pick a fresh random seed each run;
+                               # set to an integer to replay a specific layout
 
 # Global variables for handling threads
 latest_sensor_data = None
@@ -195,7 +197,20 @@ class CrazyflieInDroneDome(Supervisor):
 
     # Randomise the positions of the drone, obstacles, goal, take-off pad and landing pad
     def randomise_positions(self):
-                               
+        import os
+
+        # Determine seed: use rand_seed if set, otherwise pick a fresh one.
+        seed = rand_seed if rand_seed is not None else random.randint(0, 2**31 - 1)
+        random.seed(seed)
+        np.random.seed(seed)
+
+        # Persist the seed so any run can be replayed by setting rand_seed = <value>.
+        _project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        seed_file = os.path.join(_project_dir, 'last_seed.txt')
+        with open(seed_file, 'w') as _sf:
+            _sf.write(str(seed) + '\n')
+        print(f"[Seed] {seed}  (saved to last_seed.txt — set rand_seed={seed} to replay)")
+
         for i in range(self.num_segments):
 
             # Randomise the angular position of the gate in polar coordinates
