@@ -2,6 +2,7 @@ import os
 
 import cv2
 import numpy as np
+from scipy.interpolate import CubicSpline
 
 # ---------------------------------------------------------------------------
 # Output directory
@@ -78,6 +79,16 @@ SEARCH_Z_AMP     = 0.20   # m – vertical oscillation amplitude during search
 SEARCH_Z_RATE    = 0.06   # rad/step for vertical oscillation
 SIDE_STEP_DIST   = 2.0    # m – lateral offset (rightward) after gate pass before rotating
 SIDE_STEP_TOL    = 0.15   # m – arrival threshold for the side-step waypoint
+
+# Lap spline (laps 2 and 3)
+# One knot per gate (gate centre).  Periodic CubicSpline through the 5 gate
+# centres produces the smooth oval racing line naturally without any
+# artificial before/after tangent constraints.
+LAP_SEG_T        = 2.0    # s per gate-to-gate spline segment (spline parameterisation only)
+LAP_SPEED        = 3.5    # m/s target speed during laps 2/3 (raise for more risk/speed)
+LAP_LOOKAHEAD_T  = 0.8    # s of spline ahead to use as tracking target
+LAP_POLY_MIN_T   = 0.25   # minimum polynomial duration for lap replans
+LAP_SEARCH_AHEAD = LAP_SEG_T * 1.5 # s of spline to search when projecting drone position
 
 # CCW sector ordering constraint.
 # Each gate's angular position (atan2 from ARENA_CENTER) is used to determine
@@ -317,6 +328,7 @@ class MyAssignment:
     # State machine constants
     _S_APPROACH = 'approach'
     _S_SEARCH   = 'search'
+    _S_LAP      = 'lap'
     _S_DONE     = 'done'
 
     def __init__(self):
@@ -350,6 +362,13 @@ class MyAssignment:
         self._plan_T        = 1.0   # duration of current polynomial
         self._last_replan   = -999.0
         self._sim_time      = 0.0   # accumulated dt (seconds)
+
+        # Lap spline (built after all gates passed in lap 1)
+        self._gates_order    = []    # gate indices in the order they were passed
+        self._lap_spline     = None  # CubicSpline (position vs knot time)
+        self._lap_spline_vel = None  # first derivative of _lap_spline
+        self._lap_total_T    = 0.0   # period of one lap on the spline (s)
+        self._lap_t_progress = 0.0   # current closest-point parameter along spline
 
     # ------------------------------------------------------------------
     # Detection
@@ -438,18 +457,21 @@ class MyAssignment:
         if not unvisited:
             return None
 
-        # No gate passed yet – return nearest without ordering constraint
-        if self._last_gate_angle is None:
-            return min(unvisited,
-                       key=lambda i: float(np.linalg.norm(drone_xy - self._gates[i]['pos'][:2])))
-
         sector_rad  = 2.0 * np.pi / NUM_GATES   # one sector ≈ 72° for N=5
         lo          = np.radians(SECTOR_MIN_DEG)
 
-        # Drone's current CCW advance from the last passed gate
-        drone_angle   = float(np.arctan2(drone_xy[1] - ARENA_CENTER[1],
-                                         drone_xy[0] - ARENA_CENTER[0]))
-        drone_advance = (drone_angle - self._last_gate_angle) % (2.0 * np.pi)
+        # Reference angle for the CCW ordering constraint.
+        # After the first gate: use that gate's angular position.
+        # Before any gate is passed: use the drone's own angular position so the
+        # sector window is anchored at the drone rather than skipped entirely.
+        # This prevents targeting a gate that is angularly "behind" the drone
+        # (e.g. gate 5 when gate 1 is the natural next CCW gate).
+        drone_angle = float(np.arctan2(drone_xy[1] - ARENA_CENTER[1],
+                                       drone_xy[0] - ARENA_CENTER[0]))
+        ref_angle   = self._last_gate_angle if self._last_gate_angle is not None else drone_angle
+
+        # Drone's CCW advance from the reference angle (0 when ref = drone position)
+        drone_advance = (drone_angle - ref_angle) % (2.0 * np.pi)
 
         # Primary: gate must be within one sector ahead of the drone's position
         hi_primary = drone_advance + sector_rad
@@ -463,7 +485,7 @@ class MyAssignment:
             pos     = self._gates[i]['pos']
             angle   = float(np.arctan2(pos[1] - ARENA_CENTER[1],
                                        pos[0] - ARENA_CENTER[0]))
-            advance = (angle - self._last_gate_angle) % (2.0 * np.pi)
+            advance = (angle - ref_angle) % (2.0 * np.pi)
             if lo <= advance <= hi:
                 candidates.append((i, advance))
 
@@ -521,7 +543,7 @@ class MyAssignment:
         self._plan_T      = T_APPROACH
         self._last_replan = self._sim_time
 
-    def _replan_to(self, target_xyz, duration=T_APPROACH):
+    def _replan_to(self, target_xyz, duration=T_APPROACH, target_vel=None):
         """
         Smooth replan toward target_xyz.
 
@@ -529,16 +551,99 @@ class MyAssignment:
         predicted (position, velocity, acceleration), then fits a new polynomial
         from that predicted state to target_xyz.  This guarantees C2 continuity
         across replans — no teleporting or velocity discontinuities.
+
+        target_vel : desired velocity at target_xyz (None → zero, use non-zero for
+                     waypoints that should be passed through without stopping).
         """
         t_eval = min(self._sim_time + T_REPLAN_BUF,
                      self._plan_t0 + self._plan_T)
         tau    = t_eval - self._plan_t0
         p0, v0, a0 = _poly5_eval(self._plan_coeff, tau, self._plan_T)
 
-        self._plan_coeff  = _poly5_fit(p0, v0, a0, target_xyz, np.zeros(3), np.zeros(3), duration)
+        v1 = np.zeros(3) if target_vel is None else np.asarray(target_vel, float)
+        self._plan_coeff  = _poly5_fit(p0, v0, a0, target_xyz, v1, np.zeros(3), duration)
         self._plan_t0     = t_eval
         self._plan_T      = duration
         self._last_replan = self._sim_time
+
+    def _build_lap_spline(self, start_xyz):
+        """
+        Fit a periodic cubic spline through the gate centres in pass order.
+
+        One knot per gate (the gate centre position).  A periodic CubicSpline
+        through N gate centres naturally produces the smooth oval racing line
+        without imposing artificial before/after tangent constraints that would
+        introduce oscillations or detours.
+
+        The spline and its derivative are stored; the active polynomial is seeded
+        from the drone's current position to knot-0 so _replan_to has a valid
+        state to sample from on the very first control step.
+        """
+        waypoints = []
+        for gate_idx in self._gates_order:
+            gate_pos = self._gates[gate_idx]['pos']
+            z = float(gate_pos[2]) if not np.isnan(float(gate_pos[2])) else CRUISE_Z
+            waypoints.append(np.array([float(gate_pos[0]), float(gate_pos[1]), z]))
+
+        N = len(waypoints)
+        if N < 2:
+            return
+
+        # Uniform time knots; close the loop by repeating the first point.
+        t_knots = np.arange(N + 1) * LAP_SEG_T
+        pts     = np.vstack(waypoints + [waypoints[0]])   # (N+1, 3)
+
+        # Periodic BC: equal first and second derivatives at the seam.
+        self._lap_spline     = CubicSpline(t_knots, pts, bc_type='periodic')
+        self._lap_spline_vel = self._lap_spline.derivative()
+        self._lap_total_T    = float(N * LAP_SEG_T)
+        self._lap_t_progress = 0.0
+
+        # Seed the active polynomial from the drone toward the t=0 spline point.
+        sv0    = self._lap_spline_vel(0.0)
+        sp0    = self._lap_spline(0.0)
+        dist   = float(np.linalg.norm(start_xyz - sp0))
+        init_T = max(1.0, dist / 1.5)
+        self._plan_coeff  = _poly5_fit(
+            start_xyz, np.zeros(3), np.zeros(3),
+            sp0, sv0, np.zeros(3),
+            init_T,
+        )
+        self._plan_t0     = self._sim_time
+        self._plan_T      = init_T
+        self._last_replan = self._sim_time
+
+        print(f"[Nav] cubic spline: {N} gate-centre knots, total_T={self._lap_total_T:.1f}s")
+        self._plot_lap_spline(waypoints, start_xyz)
+
+    def _plot_lap_spline(self, waypoints, start_xyz):
+        """
+        Open an interactive 3-D figure of the planned lap path in a separate process.
+
+        Matplotlib's GUI event loop must run on a main thread.  Spawning a fresh
+        process gives the plot its own main thread so the window is fully
+        interactive (rotate, zoom, pan) without blocking the planner.
+        """
+        import multiprocessing
+
+        total_T = len(waypoints) * LAP_SEG_T
+        t_dense = np.linspace(0, total_T, 400)
+        curve   = self._lap_spline(t_dense)          # (400, 3) ndarray
+
+        gate_centres = [
+            (int(gi + 1), [float(v) for v in self._gates[gi]['pos']])
+            for gi in self._gates_order
+        ]
+
+        p = multiprocessing.Process(
+            target=_spline_plot_process,
+            args=(curve.tolist(),
+                  [wp.tolist() for wp in waypoints],
+                  gate_centres,
+                  [float(v) for v in start_xyz]),
+            daemon=True,
+        )
+        p.start()
 
     # ------------------------------------------------------------------
     # Navigation state machine
@@ -554,6 +659,50 @@ class MyAssignment:
         # ── DONE ──────────────────────────────────────────────────────────
         if self._nav_state == self._S_DONE:
             return [drone_xyz[0], drone_xyz[1], CRUISE_Z, yaw]
+
+        # ── LAP: continuously-updated closest-point tracking on cubic spline ──
+        if self._nav_state == self._S_LAP:
+            if self._lap_spline is None:
+                return [drone_xyz[0], drone_xyz[1], CRUISE_Z, yaw]
+
+            # ── 1. Project drone onto spline (closest-point advance) ──────────
+            # Sample the spline from the current progress up to LAP_SEARCH_AHEAD
+            # seconds ahead, find the closest sample, and advance _lap_t_progress.
+            # Searching only forward prevents the progress from drifting backward.
+            t_lo      = self._lap_t_progress
+            t_hi      = t_lo + LAP_SEARCH_AHEAD
+            t_samples = np.linspace(t_lo, t_hi, 60) % self._lap_total_T
+            pts       = self._lap_spline(t_samples)               # (60, 3)
+            best      = int(np.argmin(np.linalg.norm(pts - drone_xyz, axis=1)))
+            self._lap_t_progress = float(
+                np.linspace(t_lo, t_hi, 60)[best] % self._lap_total_T
+            )
+
+            # ── 2. Lookahead target on the spline ─────────────────────────────
+            t_ref   = (self._lap_t_progress + LAP_LOOKAHEAD_T) % self._lap_total_T
+            ref_pos = self._lap_spline(t_ref)
+            ref_vel = self._lap_spline_vel(t_ref)
+
+            # ── 3. Replan toward the (continuously updated) target ────────────
+            # Same mechanism as phase-0 approach on lap 1: _replan_to fires every
+            # REPLAN_INTERVAL, samples the current polynomial T_REPLAN_BUF ahead
+            # for C2 continuity, and fits a new polynomial to ref_pos / ref_vel.
+            if self._sim_time - self._last_replan > REPLAN_INTERVAL:
+                dist_to_ref = float(np.linalg.norm(drone_xyz - ref_pos))
+                seg_T = max(LAP_POLY_MIN_T, dist_to_ref / LAP_SPEED)
+                self._replan_to(ref_pos, duration=seg_T, target_vel=ref_vel)
+
+            tau = self._sim_time - self._plan_t0
+            sp, vel, _ = _poly5_eval(self._plan_coeff, tau, self._plan_T)
+
+            # Yaw from polynomial velocity; fall back to spline tangent when slow.
+            vx, vy = float(vel[0]), float(vel[1])
+            if abs(vx) > 0.05 or abs(vy) > 0.05:
+                yaw_cmd = float(np.arctan2(vy, vx))
+            else:
+                svx, svy = float(ref_vel[0]), float(ref_vel[1])
+                yaw_cmd = float(np.arctan2(svy, svx)) if (abs(svx) > 0.05 or abs(svy) > 0.05) else yaw
+            return [float(sp[0]), float(sp[1]), float(sp[2]), yaw_cmd]
 
         # ── APPROACH ──────────────────────────────────────────────────────
         if self._nav_state == self._S_APPROACH and self._gate_d_hat is not None:
@@ -641,12 +790,14 @@ class MyAssignment:
                     self._last_gate_angle = float(
                         np.arctan2(gp[1] - ARENA_CENTER[1], gp[0] - ARENA_CENTER[0])
                     )
+                    self._gates_order.append(self._target_gate)
                     self._gates_passed.add(self._target_gate)
                     print(f"[Nav] gate {self._target_gate + 1} passed "
                           f"({len(self._gates_passed)}/{NUM_GATES})")
                     if len(self._gates_passed) >= NUM_GATES:
-                        self._nav_state = self._S_DONE
-                        print("[Nav] all gates passed → DONE")
+                        self._build_lap_spline(drone_xyz)
+                        self._nav_state = self._S_LAP
+                        print("[Nav] all gates passed → LAP")
                         return [drone_xyz[0], drone_xyz[1], CRUISE_Z, yaw]
                     self._nav_state  = self._S_SEARCH
                     self._search_yaw = yaw
@@ -743,6 +894,51 @@ class MyAssignment:
         cv2.imwrite(path, out)
         print(f"[Save] gate_{gate_num}.png  pos=({world_pos[0]:.2f},"
               f"{world_pos[1]:.2f},{world_pos[2]:.2f})")
+
+
+def _spline_plot_process(curve, waypoints, gate_centres, start_xyz):
+    """
+    Render an interactive 3-D spline figure.
+
+    Runs in a dedicated child process so matplotlib's GUI event loop lives on
+    that process's main thread.  All arguments are plain Python lists so they
+    survive pickling across the process boundary.
+    """
+    import matplotlib.pyplot as plt
+
+    curve = [tuple(p) for p in curve]
+    xs, ys, zs = zip(*curve)
+
+    fig = plt.figure(figsize=(9, 7))
+    ax  = fig.add_subplot(111, projection='3d')
+
+    # Spline path
+    ax.plot(xs, ys, zs, color='steelblue', linewidth=2, label='spline path')
+
+    # Knots (before / after each gate)
+    wx = [p[0] for p in waypoints]
+    wy = [p[1] for p in waypoints]
+    wz = [p[2] for p in waypoints]
+    ax.scatter(wx, wy, wz, color='limegreen', s=50, zorder=5, label='knots')
+
+    # Gate centres + labels
+    for label, pos in gate_centres:
+        ax.scatter(pos[0], pos[1], pos[2],
+                   color='red', marker='x', s=100, linewidths=2)
+        ax.text(pos[0], pos[1], pos[2] + 0.10,
+                f'G{label}', fontsize=9, ha='center', color='red')
+
+    # Drone position at end of lap 1
+    ax.scatter(start_xyz[0], start_xyz[1], start_xyz[2],
+               color='orange', marker='*', s=150, zorder=6, label='lap 1 end')
+
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_zlabel('Z (m)')
+    ax.set_title('Lap 2/3 planned path  –  drag to rotate')
+    ax.legend(loc='upper right', fontsize=9)
+    plt.tight_layout()
+    plt.show()   # blocks until the window is closed; fine in a daemon process
 
 
 def _save_results(gates):
