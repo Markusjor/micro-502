@@ -60,18 +60,87 @@ NUM_GATES          = 5
 # ---------------------------------------------------------------------------
 # Navigation
 # ---------------------------------------------------------------------------
-CRUISE_Z         = 1.0   # m – default flight altitude
-APPROACH_DIST    = 1.5   # m – approach waypoint in front of gate centre
-PAST_DIST        = 1.2   # m – how far past the gate centre before switching to SEARCH
-TRAJ_STEP_THRESH = 0.15  # m – advance to next trajectory setpoint when within this distance
-T_SEG            = 2.5   # s – time budget per waypoint-to-waypoint segment
-DISC_STEPS       = 20    # trajectory points per segment
-SEARCH_YAW_RATE  = 0.04  # rad per control step while rotating to find next gate
+ARENA_CENTER     = np.array([4.0, 4.0])  # gates arranged tangentially around this
+CRUISE_Z         = 1.0    # m – default flight altitude
+APPROACH_DIST    = 0.4    # m – approach point in front of gate on its normal
+PAST_DIST        = 1.2    # m – how far past gate centre before gate is considered passed
+T_APPROACH       = 2.5    # s – polynomial duration for flying to approach point
+T_THROUGH        = 1.5    # s – polynomial duration for flying through gate
+T_REPLAN_BUF     = 0.4    # s – time-ahead buffer: replan from polynomial state this far ahead
+REPLAN_INTERVAL  = 0.25   # s – replan approach polynomial at least this often
+APPROACH_TOL     = 0.06   # m – arrival radius at approach point → switch to ALIGN
+ALIGN_TOL        = 0.10   # m – position must stay within this during ALIGN (else counter resets)
+YAW_TOL          = 0.12   # rad – yaw must be within this before ALIGN counter advances
+ALIGN_STEPS      = 80     # consecutive on-target control steps required before flying through
+YAW_RATE_MAX     = 0.06   # rad/step – max yaw rate during alignment
+SEARCH_YAW_RATE  = 0.04   # rad/step
+SEARCH_Z_AMP     = 0.20   # m – vertical oscillation amplitude during search
+SEARCH_Z_RATE    = 0.06   # rad/step for vertical oscillation
+SIDE_STEP_DIST   = 2.0    # m – lateral offset (rightward) after gate pass before rotating
+SIDE_STEP_TOL    = 0.15   # m – arrival threshold for the side-step waypoint
 
-# Arena bounds for trajectory clipping
-ARENA_XMIN, ARENA_XMAX = 0.0, 9.0
-ARENA_YMIN, ARENA_YMAX = 0.0, 9.0
+# CCW sector ordering constraint.
+# Each gate's angular position (atan2 from ARENA_CENTER) is used to determine
+# whether it could be the immediately next gate in the circuit.
+#
+# Primary check: the candidate's CCW advance from the last passed gate must be
+# ≤ (drone's own CCW advance) + one sector (360/N).  This uses the drone's
+# current global position to ask "is there room for an undetected gate between
+# me and this candidate?"  If the candidate is more than one sector ahead of
+# where the drone currently is, there likely IS an undetected gate in between.
+#
+# When no gate passes the primary check the drone flies toward the estimated
+# position of the next sector so it can physically search there.  After
+# SECTOR_FALLBACK_STEPS of searching without success the constraint is relaxed
+# to SECTOR_WIDE_DEG to recover from unusual spacings.
+SECTOR_MIN_DEG      = 15     # deg – minimum CCW advance (prevents going backward)
+SECTOR_WIDE_DEG     = 200    # deg – fallback maximum after extended searching
+SECTOR_FALLBACK_STEPS = 200  # search steps before switching to wide window
 
+
+
+# ---------------------------------------------------------------------------
+# Polynomial planner helpers
+# ---------------------------------------------------------------------------
+def _poly5_fit(p0, v0, a0, p1, v1, a1, T):
+    """
+    Fit a 5th-order polynomial for each spatial dimension.
+    Boundary conditions: position, velocity, acceleration at t=0 and t=T.
+    Returns (3, 6) coefficient array c such that x(t) = c @ [1,t,t²,t³,t⁴,t⁵].
+    """
+    T = max(float(T), 0.05)
+    M = np.array([
+        [1,  0,    0,      0,       0,        0      ],
+        [0,  1,    0,      0,       0,        0      ],
+        [0,  0,    2,      0,       0,        0      ],
+        [1,  T,    T**2,   T**3,    T**4,     T**5   ],
+        [0,  1,    2*T,    3*T**2,  4*T**3,   5*T**4 ],
+        [0,  0,    2,      6*T,    12*T**2,  20*T**3 ],
+    ])
+    p0, v0, a0 = np.asarray(p0, float), np.asarray(v0, float), np.asarray(a0, float)
+    p1, v1, a1 = np.asarray(p1, float), np.asarray(v1, float), np.asarray(a1, float)
+    coeff = np.zeros((3, 6))
+    for d in range(3):
+        coeff[d] = np.linalg.solve(M, [p0[d], v0[d], a0[d], p1[d], v1[d], a1[d]])
+    return coeff
+
+
+def _poly5_eval(coeff, tau, T):
+    """
+    Evaluate position, velocity, and acceleration of a 5th-order polynomial.
+    tau is clamped to [0, T].  Returns (pos, vel, acc) each shape (3,).
+    """
+    tau = float(np.clip(tau, 0.0, float(T)))
+    t2, t3, t4, t5 = tau**2, tau**3, tau**4, tau**5
+    pos = coeff @ np.array([1,   tau,    t2,      t3,       t4,       t5    ])
+    vel = coeff @ np.array([0,   1,      2*tau,   3*tau**2, 4*tau**3, 5*tau**4])
+    acc = coeff @ np.array([0,   0,      2,       6*tau,   12*tau**2, 20*tau**3])
+    return pos, vel, acc
+
+
+def _angle_wrap(a):
+    """Wrap angle to [-π, π]."""
+    return float((a + np.pi) % (2 * np.pi) - np.pi)
 
 
 # ---------------------------------------------------------------------------
@@ -256,13 +325,31 @@ class MyAssignment:
         self._gates = []
 
         # Navigation state machine
-        self._nav_state       = self._S_SEARCH
-        self._gates_passed    = set()
-        self._traj            = None   # (N, 3) discretised trajectory
-        self._traj_idx        = 0
-        self._target_gate     = None   # index into self._gates
-        self._centre_traj_idx = None   # traj index where gate is considered passed
-        self._search_yaw      = 0.0
+        self._nav_state     = self._S_SEARCH
+        self._gates_passed           = set()
+        self._target_gate            = None
+        self._last_gate_angle        = None  # angle from ARENA_CENTER of last passed gate (rad)
+        self._search_yaw             = 0.0
+        self._search_step            = 0
+        self._search_steps_no_target = 0     # increments while SEARCH finds no valid gate
+        self._search_side_target     = None  # brief rightward move after gate pass
+
+        # Approach geometry (set by _plan_to_gate, fixed for current gate)
+        self._gate_ap       = None   # approach point [x,y,z] – 0.4m in front of gate
+        self._gate_past     = None   # past point [x,y,z] – PAST_DIST beyond gate
+        self._gate_d_hat    = None   # unit vector: approach direction (gate's outward normal)
+        self._gate_yaw      = 0.0   # yaw angle that faces the gate
+
+        # Sub-phase within APPROACH: 0=fly-to-AP, 1=align-yaw, 2=through-gate
+        self._ap_phase      = 0
+        self._align_count   = 0
+
+        # Smooth polynomial plan state
+        self._plan_coeff    = None   # (3,6) 5th-order polynomial coefficients, or None
+        self._plan_t0       = 0.0   # sim time when current polynomial was fitted
+        self._plan_T        = 1.0   # duration of current polynomial
+        self._last_replan   = -999.0
+        self._sim_time      = 0.0   # accumulated dt (seconds)
 
     # ------------------------------------------------------------------
     # Detection
@@ -324,85 +411,134 @@ class MyAssignment:
     # ------------------------------------------------------------------
 
     def _nearest_unvisited(self, drone_xy):
-        """Return the index of the nearest known gate not yet passed, or None."""
-        best_idx  = None
-        best_dist = float('inf')
-        for i, g in enumerate(self._gates):
-            if i in self._gates_passed:
-                continue
-            d = float(np.linalg.norm(drone_xy - g['pos'][:2]))
-            if d < best_dist:
-                best_dist = d
-                best_idx  = i
-        return best_idx
-
-    def _poly_matrix(self, t):
-        """6×6 constraint matrix for a 5th-order polynomial segment of duration t."""
-        T = float(t)
-        return np.array([
-            [1,  0,    0,      0,       0,        0      ],  # p(0)
-            [0,  1,    0,      0,       0,        0      ],  # p'(0)
-            [0,  0,    2,      0,       0,        0      ],  # p''(0)
-            [1,  T,    T**2,   T**3,    T**4,     T**5   ],  # p(T)
-            [0,  1,    2*T,    3*T**2,  4*T**3,   5*T**4 ],  # p'(T)
-            [0,  0,    2,      6*T,    12*T**2,  20*T**3 ],  # p''(T)
-        ])
-
-    def _min_jerk_trajectory(self, waypoints):
         """
-        Build a minimum-jerk trajectory through *waypoints* (list of [x,y,z]).
-        Each segment uses a 5th-order polynomial with zero velocity and
-        acceleration at both endpoints.
+        Return the index of the next gate to target in CCW order, or None.
 
-        Returns an (N, 3) ndarray of discretised positions.
+        After the first gate is passed the method uses the drone's current global
+        position to enforce a single-sector lookahead:
+
+          gate_advance  = CCW angle from last-passed-gate to candidate
+          drone_advance = CCW angle from last-passed-gate to drone's current position
+
+        A candidate is accepted only when:
+          gate_advance  ≤  drone_advance + sector_size          (primary)
+
+        This rejects a gate that is more than one sector ahead of where the drone
+        currently is, preventing a gate that is two CCW slots away from being
+        targeted before the closer (undetected) intermediate gate is found.
+
+        After SECTOR_FALLBACK_STEPS search steps without any valid target the
+        window relaxes to SECTOR_WIDE_DEG so the drone recovers from layouts
+        where the true next gate genuinely has an above-average angular gap.
+
+        Among all passing candidates the one with the smallest CCW advance is
+        returned – strict ordering regardless of physical distance.
         """
-        M   = self._poly_matrix(T_SEG)
-        pts = []
-        n   = len(waypoints)
+        unvisited = [i for i in range(len(self._gates)) if i not in self._gates_passed]
+        if not unvisited:
+            return None
 
-        for i in range(n - 1):
-            p0 = np.array(waypoints[i][:3],   dtype=float)
-            p1 = np.array(waypoints[i + 1][:3], dtype=float)
-            # include endpoint only for the last segment to avoid duplicates
-            last_seg = (i == n - 2)
-            ts = np.linspace(0.0, T_SEG, DISC_STEPS, endpoint=last_seg)
+        # No gate passed yet – return nearest without ordering constraint
+        if self._last_gate_angle is None:
+            return min(unvisited,
+                       key=lambda i: float(np.linalg.norm(drone_xy - self._gates[i]['pos'][:2])))
 
-            seg = np.zeros((len(ts), 3))
-            for dim in range(3):
-                b = np.array([p0[dim], 0.0, 0.0, p1[dim], 0.0, 0.0])
-                c = np.linalg.solve(M, b)
-                for j, t in enumerate(ts):
-                    seg[j, dim] = (c[0] + c[1]*t + c[2]*t**2
-                                   + c[3]*t**3 + c[4]*t**4 + c[5]*t**5)
-            pts.append(seg)
+        sector_rad  = 2.0 * np.pi / NUM_GATES   # one sector ≈ 72° for N=5
+        lo          = np.radians(SECTOR_MIN_DEG)
 
-        return np.vstack(pts)
+        # Drone's current CCW advance from the last passed gate
+        drone_angle   = float(np.arctan2(drone_xy[1] - ARENA_CENTER[1],
+                                         drone_xy[0] - ARENA_CENTER[0]))
+        drone_advance = (drone_angle - self._last_gate_angle) % (2.0 * np.pi)
+
+        # Primary: gate must be within one sector ahead of the drone's position
+        hi_primary = drone_advance + sector_rad
+        # Fallback: after extended search use the wide fixed window
+        hi_fallback = np.radians(SECTOR_WIDE_DEG)
+        use_fallback = self._search_steps_no_target >= SECTOR_FALLBACK_STEPS
+        hi = hi_fallback if use_fallback else hi_primary
+
+        candidates = []
+        for i in unvisited:
+            pos     = self._gates[i]['pos']
+            angle   = float(np.arctan2(pos[1] - ARENA_CENTER[1],
+                                       pos[0] - ARENA_CENTER[0]))
+            advance = (angle - self._last_gate_angle) % (2.0 * np.pi)
+            if lo <= advance <= hi:
+                candidates.append((i, advance))
+
+        if not candidates:
+            return None
+
+        # Strict CCW ordering: pick smallest advance (not nearest by distance)
+        return min(candidates, key=lambda x: x[1])[0]
 
     def _plan_to_gate(self, gate_idx, drone_xyz):
-        """Build and store a min-jerk trajectory toward gate *gate_idx*."""
+        """
+        Select approach geometry for gate *gate_idx* and fit the initial polynomial.
+
+        The approach axis is tangential to the CCW circuit around ARENA_CENTER.
+        The approach point (AP) is placed APPROACH_DIST metres in front of the gate
+        on the side closest to the drone so we never fly around the back.
+        """
         gate_pos = self._gates[gate_idx]['pos']
         z = float(gate_pos[2]) if not np.isnan(float(gate_pos[2])) else CRUISE_Z
 
-        to_gate = gate_pos[:2] - drone_xyz[:2]
-        dist    = float(np.linalg.norm(to_gate))
-        d_hat   = to_gate / dist if dist > 0.1 else np.array([1.0, 0.0])
+        radial = gate_pos[:2] - ARENA_CENTER
+        r_len  = float(np.linalg.norm(radial))
+        if r_len > 0.2:
+            r_hat   = radial / r_len
+            tangent = np.array([-r_hat[1], r_hat[0]])   # 90° CCW = tangential (gate normal)
+            ap_a = gate_pos[:2] - tangent * APPROACH_DIST
+            ap_b = gate_pos[:2] + tangent * APPROACH_DIST
+            drone_xy = drone_xyz[:2]
+            if np.linalg.norm(drone_xy - ap_a) <= np.linalg.norm(drone_xy - ap_b):
+                d_hat, ap_xy = tangent, ap_a
+            else:
+                d_hat, ap_xy = -tangent, ap_b
+        else:
+            to_gate = gate_pos[:2] - drone_xyz[:2]
+            dist    = float(np.linalg.norm(to_gate))
+            d_hat   = to_gate / dist if dist > 0.1 else np.array([1.0, 0.0])
+            ap_xy   = gate_pos[:2] - d_hat * APPROACH_DIST
 
-        ap   = gate_pos[:2] - d_hat * APPROACH_DIST   # approach point
-        past = gate_pos[:2] + d_hat * PAST_DIST        # pull-through point
+        past_xy = gate_pos[:2] + d_hat * PAST_DIST
 
-        waypoints = [
-            [drone_xyz[0], drone_xyz[1], drone_xyz[2]],
-            [ap[0],        ap[1],        z            ],
-            [gate_pos[0],  gate_pos[1],  z            ],
-            [past[0],      past[1],      z            ],
-        ]
+        self._gate_ap    = np.array([ap_xy[0],   ap_xy[1],   z])
+        self._gate_past  = np.array([past_xy[0], past_xy[1], z])
+        self._gate_d_hat = d_hat.copy()
+        self._gate_yaw   = float(np.arctan2(d_hat[1], d_hat[0]))
+        self._ap_phase   = 0
+        self._align_count = 0
 
-        traj = self._min_jerk_trajectory(waypoints)
-        self._traj            = traj
-        self._traj_idx        = 0
-        # Gate is considered passed once we reach the end of the trajectory
-        # (which is PAST_DIST beyond the gate centre).
-        self._centre_traj_idx = len(traj) - 1
+        # Fit initial polynomial from current drone position (at rest) to AP.
+        self._plan_coeff  = _poly5_fit(
+            drone_xyz, np.zeros(3), np.zeros(3),
+            self._gate_ap, np.zeros(3), np.zeros(3),
+            T_APPROACH,
+        )
+        self._plan_t0     = self._sim_time
+        self._plan_T      = T_APPROACH
+        self._last_replan = self._sim_time
+
+    def _replan_to(self, target_xyz, duration=T_APPROACH):
+        """
+        Smooth replan toward target_xyz.
+
+        Samples the current polynomial T_REPLAN_BUF seconds ahead to obtain the
+        predicted (position, velocity, acceleration), then fits a new polynomial
+        from that predicted state to target_xyz.  This guarantees C2 continuity
+        across replans — no teleporting or velocity discontinuities.
+        """
+        t_eval = min(self._sim_time + T_REPLAN_BUF,
+                     self._plan_t0 + self._plan_T)
+        tau    = t_eval - self._plan_t0
+        p0, v0, a0 = _poly5_eval(self._plan_coeff, tau, self._plan_T)
+
+        self._plan_coeff  = _poly5_fit(p0, v0, a0, target_xyz, np.zeros(3), np.zeros(3), duration)
+        self._plan_t0     = t_eval
+        self._plan_T      = duration
+        self._last_replan = self._sim_time
 
     # ------------------------------------------------------------------
     # Navigation state machine
@@ -412,55 +548,155 @@ class MyAssignment:
         drone_xyz = np.array([sensor_data['x_global'],
                               sensor_data['y_global'],
                               sensor_data['z_global']])
-        drone_xy  = drone_xyz[:2]
-        yaw       = float(sensor_data['yaw'])
+        drone_xy = drone_xyz[:2]
+        yaw      = float(sensor_data['yaw'])
 
         # ── DONE ──────────────────────────────────────────────────────────
         if self._nav_state == self._S_DONE:
             return [drone_xyz[0], drone_xyz[1], CRUISE_Z, yaw]
 
-        # ── APPROACH: follow trajectory, check if gate is passed ──────────
-        if self._nav_state == self._S_APPROACH and self._traj is not None:
-            pt   = self._traj[self._traj_idx]
-            dist = float(np.linalg.norm(drone_xyz - pt))
-            if dist < TRAJ_STEP_THRESH and self._traj_idx < len(self._traj) - 1:
-                self._traj_idx += 1
+        # ── APPROACH ──────────────────────────────────────────────────────
+        if self._nav_state == self._S_APPROACH and self._gate_d_hat is not None:
+            ap_xy = self._gate_ap[:2]
+            ap_z  = float(self._gate_ap[2])
 
-            if self._traj_idx >= self._centre_traj_idx:
-                # Gate passed
-                self._gates_passed.add(self._target_gate)
-                print(f"[Nav] gate {self._target_gate + 1} passed "
-                      f"({len(self._gates_passed)}/{NUM_GATES})")
-                if len(self._gates_passed) >= NUM_GATES:
-                    self._nav_state = self._S_DONE
-                    print("[Nav] all gates passed → DONE")
-                    return [drone_xyz[0], drone_xyz[1], CRUISE_Z, yaw]
-                self._nav_state = self._S_SEARCH
-                self._search_yaw = yaw
-                print("[Nav] → SEARCH")
-                # fall through to SEARCH below
-            else:
-                pt = self._traj[self._traj_idx]
-                if self._traj_idx < len(self._traj) - 1:
-                    nxt = self._traj[self._traj_idx + 1]
-                    dx, dy = nxt[0] - pt[0], nxt[1] - pt[1]
-                    if abs(dx) + abs(dy) > 0.01:
-                        yaw = float(np.arctan2(dy, dx))
-                return [float(pt[0]), float(pt[1]), float(pt[2]), yaw]
+            # ── Phase 0: smooth polynomial to approach point ───────────────
+            if self._ap_phase == 0:
+                # Keep AP position in sync with the latest gate position estimate
+                gate_pos  = self._gates[self._target_gate]['pos']
+                z_new     = float(gate_pos[2]) if not np.isnan(float(gate_pos[2])) else CRUISE_Z
+                ap_xy_new = gate_pos[:2] - self._gate_d_hat * APPROACH_DIST
+                ap_xyz_new = np.array([ap_xy_new[0], ap_xy_new[1], z_new])
 
-        # ── SEARCH: rotate until a gate is visible, then approach ─────────
+                # Replan if AP shifted or enough time has elapsed since last replan.
+                # The replan samples the current polynomial T_REPLAN_BUF s ahead and
+                # fits a new polynomial from that predicted (p, v, a) – guaranteeing
+                # C2 continuity so the drone never feels a jerk.
+                ap_shift = float(np.linalg.norm(ap_xyz_new[:2] - self._gate_ap[:2]))
+                if (self._sim_time - self._last_replan > REPLAN_INTERVAL
+                        or ap_shift > 0.05):
+                    self._gate_ap   = ap_xyz_new
+                    self._gate_past = np.array([
+                        gate_pos[0] + self._gate_d_hat[0] * PAST_DIST,
+                        gate_pos[1] + self._gate_d_hat[1] * PAST_DIST,
+                        z_new,
+                    ])
+                    self._replan_to(self._gate_ap)
+                    ap_xy = self._gate_ap[:2]
+                    ap_z  = float(self._gate_ap[2])
+
+                # Evaluate setpoint from the continuous polynomial
+                tau = self._sim_time - self._plan_t0
+                sp, _, _ = _poly5_eval(self._plan_coeff, tau, self._plan_T)
+
+                # Transition when drone is close enough to AP
+                if float(np.linalg.norm(drone_xy - ap_xy)) < APPROACH_TOL:
+                    self._ap_phase  = 1
+                    self._align_count = 0
+                    print(f"[Nav] gate {self._target_gate + 1} AP reached → ALIGN")
+
+                return [float(sp[0]), float(sp[1]), float(sp[2]), self._gate_yaw]
+
+            # ── Phase 1: hold at AP, align yaw, wait until settled ─────────
+            if self._ap_phase == 1:
+                yaw_err = _angle_wrap(self._gate_yaw - yaw)
+                yaw_cmd = yaw + float(np.clip(yaw_err, -YAW_RATE_MAX, YAW_RATE_MAX))
+
+                # Only count steps where drone is on-target in BOTH position and
+                # yaw; any drift resets the counter so we never fly through the
+                # gate unless the drone is truly settled on the gate normal.
+                pos_err = float(np.linalg.norm(drone_xy - ap_xy))
+                if pos_err < ALIGN_TOL and abs(yaw_err) < YAW_TOL:
+                    self._align_count += 1
+                else:
+                    self._align_count = 0
+
+                if self._align_count >= ALIGN_STEPS:
+                    self._ap_phase = 2
+                    # Fit a new polynomial from AP straight through to past point.
+                    # Starts at rest (v=0, a=0) so the drone launches smoothly.
+                    self._plan_coeff = _poly5_fit(
+                        self._gate_ap, np.zeros(3), np.zeros(3),
+                        self._gate_past, np.zeros(3), np.zeros(3),
+                        T_THROUGH,
+                    )
+                    self._plan_t0 = self._sim_time
+                    self._plan_T  = T_THROUGH
+                    print(f"[Nav] gate {self._target_gate + 1} aligned → THROUGH")
+
+                return [float(ap_xy[0]), float(ap_xy[1]), ap_z, yaw_cmd]
+
+            # ── Phase 2: fly through gate via polynomial ───────────────────
+            if self._ap_phase == 2:
+                tau = self._sim_time - self._plan_t0
+                sp, _, _ = _poly5_eval(self._plan_coeff, tau, self._plan_T)
+
+                # Gate passed when drone has moved far enough past the gate centre
+                gate_pos = self._gates[self._target_gate]['pos']
+                proj = float(np.dot(drone_xy - gate_pos[:2], self._gate_d_hat))
+
+                if proj >= PAST_DIST * 0.7 or tau >= self._plan_T:
+                    # Record the angle of this gate so CCW ordering can find the next
+                    gp = self._gates[self._target_gate]['pos']
+                    self._last_gate_angle = float(
+                        np.arctan2(gp[1] - ARENA_CENTER[1], gp[0] - ARENA_CENTER[0])
+                    )
+                    self._gates_passed.add(self._target_gate)
+                    print(f"[Nav] gate {self._target_gate + 1} passed "
+                          f"({len(self._gates_passed)}/{NUM_GATES})")
+                    if len(self._gates_passed) >= NUM_GATES:
+                        self._nav_state = self._S_DONE
+                        print("[Nav] all gates passed → DONE")
+                        return [drone_xyz[0], drone_xyz[1], CRUISE_Z, yaw]
+                    self._nav_state  = self._S_SEARCH
+                    self._search_yaw = yaw
+                    self._search_step = 0
+                    # Step right of travel direction so the next gate enters camera view
+                    right = np.array([self._gate_d_hat[1], -self._gate_d_hat[0]])
+                    side_xy = drone_xy + right * SIDE_STEP_DIST
+                    self._search_side_target = np.array([
+                        float(side_xy[0]), float(side_xy[1]),
+                        float(self._gate_ap[2]),
+                    ])
+                    self._search_steps_no_target = 0
+                    print("[Nav] → SEARCH (side-step)")
+                    # fall through to SEARCH
+                else:
+                    return [float(sp[0]), float(sp[1]), float(sp[2]), self._gate_yaw]
+
+        # ── SEARCH: look for next gate in CCW order ───────────────────────
         if self._nav_state == self._S_SEARCH:
             next_gate = self._nearest_unvisited(drone_xy)
             if next_gate is not None:
-                self._target_gate = next_gate
+                self._target_gate            = next_gate
+                self._search_steps_no_target = 0
+                self._search_side_target     = None
                 self._plan_to_gate(next_gate, drone_xyz)
                 self._nav_state = self._S_APPROACH
                 print(f"[Nav] target gate {next_gate + 1} → APPROACH")
-                pt = self._traj[0]
-                return [float(pt[0]), float(pt[1]), float(pt[2]), yaw]
-            # No gate known yet – rotate in place
-            self._search_yaw += SEARCH_YAW_RATE
-            return [drone_xyz[0], drone_xyz[1], CRUISE_Z, self._search_yaw]
+                tau = self._sim_time - self._plan_t0
+                sp, _, _ = _poly5_eval(self._plan_coeff, tau, self._plan_T)
+                return [float(sp[0]), float(sp[1]), float(sp[2]), self._gate_yaw]
+
+            # No qualifying gate found yet – rotate camera while moving/hovering.
+            self._search_yaw  += SEARCH_YAW_RATE
+            self._search_step += 1
+            z_sp = CRUISE_Z + SEARCH_Z_AMP * np.sin(self._search_step * SEARCH_Z_RATE)
+
+            # Phase A: brief rightward step after gate pass to open camera angle.
+            # Do NOT fly CCW (sector-flying): that grows drone_advance and widens
+            # the acceptance window, letting a gate two slots ahead slip through.
+            if self._search_side_target is not None:
+                dist = float(np.linalg.norm(drone_xy - self._search_side_target[:2]))
+                if dist > SIDE_STEP_TOL:
+                    return [self._search_side_target[0],
+                            self._search_side_target[1],
+                            z_sp, self._search_yaw]
+                self._search_side_target = None   # arrived – switch to rotate-in-place
+
+            # Phase B: rotate in place; increment no-target counter for fallback.
+            self._search_steps_no_target += 1
+            return [drone_xyz[0], drone_xyz[1], z_sp, self._search_yaw]
 
         # Fallback
         return [drone_xyz[0], drone_xyz[1], CRUISE_Z, yaw]
@@ -469,7 +705,9 @@ class MyAssignment:
     # Entry point
     # ------------------------------------------------------------------
 
-    def compute_command(self, sensor_data, camera_data, _dt):
+    def compute_command(self, sensor_data, camera_data, dt):
+        self._sim_time += float(dt)   # advance clock for polynomial evaluation
+
         if sensor_data['z_global'] < 0.49:
             return [sensor_data['x_global'], sensor_data['y_global'],
                     1.0, sensor_data['yaw']]
