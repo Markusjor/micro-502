@@ -54,7 +54,9 @@ MIN_PIXEL_H  = 6
 
 # Minimum XY distance (m) between saved gate positions – prevents saving the
 # same gate twice as the drone moves past it.
-_SAVE_DEDUP_RADIUS  = 1.5   # m – gates are ≥2 m apart; increased to avoid re-saving
+_SAVE_DEDUP_RADIUS  = 1.2   # m – match threshold for same-gate deduplication.
+                             # PnP noise is ~0.1–0.3 m; 0.8 m gives margin without
+                             # merging gates that are close together in tight seeds.
 _FULL_PANEL_MARGIN  = 20   # px – reject if bounding box touches frame edge (partial panels give bad PnP)
 NUM_GATES          = 5
 
@@ -62,51 +64,39 @@ NUM_GATES          = 5
 # Navigation
 # ---------------------------------------------------------------------------
 ARENA_CENTER     = np.array([4.0, 4.0])  # gates arranged tangentially around this
+ARENA_MARGIN     = 0.5                   # m – keep all waypoints this far from walls (0–8 m arena)
 CRUISE_Z         = 1.0    # m – default flight altitude
 APPROACH_DIST    = 0.4    # m – approach point in front of gate on its normal
 PAST_DIST        = 1.2    # m – how far past gate centre before gate is considered passed
 T_APPROACH       = 2.5    # s – polynomial duration for flying to approach point
 T_THROUGH        = 1.5    # s – polynomial duration for flying through gate
-T_REPLAN_BUF     = 0.4    # s – time-ahead buffer: replan from polynomial state this far ahead
-REPLAN_INTERVAL  = 0.25   # s – replan approach polynomial at least this often
+T_REPLAN_BUF     = 0.2    # s – time-ahead buffer: replan from polynomial state this far ahead
+REPLAN_INTERVAL  = 0.10   # s – replan approach polynomial at least this often
 APPROACH_TOL     = 0.06   # m – arrival radius at approach point → switch to ALIGN
 ALIGN_TOL        = 0.10   # m – position must stay within this during ALIGN (else counter resets)
 YAW_TOL          = 0.12   # rad – yaw must be within this before ALIGN counter advances
 ALIGN_STEPS      = 80     # consecutive on-target control steps required before flying through
+MIN_GATE_OBS     = 200    # minimum observations required before flying through a gate
+OBS_STALL_STEPS  = 25     # steps without new observations before starting yaw sweep
+OBS_YAW_AMP      = 0.35   # rad – yaw sweep amplitude around gate_yaw
+OBS_YAW_SPEED    = 0.04   # rad/step – sweep oscillation rate
 YAW_RATE_MAX     = 0.06   # rad/step – max yaw rate during alignment
 SEARCH_YAW_RATE  = 0.04   # rad/step
 SEARCH_Z_AMP     = 0.20   # m – vertical oscillation amplitude during search
 SEARCH_Z_RATE    = 0.06   # rad/step for vertical oscillation
-SIDE_STEP_DIST   = 2.0    # m – lateral offset (rightward) after gate pass before rotating
-SIDE_STEP_TOL    = 0.15   # m – arrival threshold for the side-step waypoint
-
+SIDE_STEP_DIST   = 2.0    # m – total rightward movement after each gate pass
+SIDE_STEP_SEGS   = 3      # number of equally-spaced waypoints in the side step
+SIDE_STEP_TOL    = 0.20   # m – 2-D arrival radius per waypoint
+SIDE_STEP_DUR    = 1.2    # s – polynomial duration per waypoint segment
 # Lap spline (laps 2 and 3)
 # One knot per gate (gate centre).  Periodic CubicSpline through the 5 gate
 # centres produces the smooth oval racing line naturally without any
 # artificial before/after tangent constraints.
 LAP_SEG_T        = 2.0    # s per gate-to-gate spline segment (spline parameterisation only)
-LAP_SPEED        = 3.5    # m/s target speed during laps 2/3 (raise for more risk/speed)
+LAP_SPEED        = 6.0    # m/s target speed during laps 2/3 (raise for more risk/speed)
 LAP_LOOKAHEAD_T  = 0.8    # s of spline ahead to use as tracking target
-LAP_POLY_MIN_T   = 0.25   # minimum polynomial duration for lap replans
+LAP_POLY_MIN_T   = 0.15   # minimum polynomial duration for lap replans
 LAP_SEARCH_AHEAD = LAP_SEG_T * 1.5 # s of spline to search when projecting drone position
-
-# CCW sector ordering constraint.
-# Each gate's angular position (atan2 from ARENA_CENTER) is used to determine
-# whether it could be the immediately next gate in the circuit.
-#
-# Primary check: the candidate's CCW advance from the last passed gate must be
-# ≤ (drone's own CCW advance) + one sector (360/N).  This uses the drone's
-# current global position to ask "is there room for an undetected gate between
-# me and this candidate?"  If the candidate is more than one sector ahead of
-# where the drone currently is, there likely IS an undetected gate in between.
-#
-# When no gate passes the primary check the drone flies toward the estimated
-# position of the next sector so it can physically search there.  After
-# SECTOR_FALLBACK_STEPS of searching without success the constraint is relaxed
-# to SECTOR_WIDE_DEG to recover from unusual spacings.
-SECTOR_MIN_DEG      = 15     # deg – minimum CCW advance (prevents going backward)
-SECTOR_WIDE_DEG     = 200    # deg – fallback maximum after extended searching
-SECTOR_FALLBACK_STEPS = 200  # search steps before switching to wide window
 
 
 
@@ -326,10 +316,12 @@ def _estimate_position(observations):
 class MyAssignment:
 
     # State machine constants
-    _S_APPROACH = 'approach'
-    _S_SEARCH   = 'search'
-    _S_LAP      = 'lap'
-    _S_DONE     = 'done'
+    _S_APPROACH  = 'approach'
+    _S_SIDE_STEP = 'side_step'
+    _S_SEARCH    = 'search'
+    _S_PRE_LAP   = 'pre_lap'   # fly to gate-1 entry before starting spline tracking
+    _S_LAP       = 'lap'
+    _S_DONE      = 'done'
 
     def __init__(self):
         # Detection – one entry per gate:
@@ -338,13 +330,14 @@ class MyAssignment:
 
         # Navigation state machine
         self._nav_state     = self._S_SEARCH
-        self._gates_passed           = set()
-        self._target_gate            = None
-        self._last_gate_angle        = None  # angle from ARENA_CENTER of last passed gate (rad)
-        self._search_yaw             = 0.0
-        self._search_step            = 0
-        self._search_steps_no_target = 0     # increments while SEARCH finds no valid gate
-        self._search_side_target     = None  # brief rightward move after gate pass
+        self._gates_passed  = set()
+        self._target_gate   = None
+        self._search_yaw    = 0.0
+        self._search_step   = 0
+
+        # Side-step state (rightward movement after each gate pass)
+        self._side_step_wps  = []   # list of np.array([x,y,z]) waypoints
+        self._side_step_idx  = 0    # index of the current target waypoint
 
         # Approach geometry (set by _plan_to_gate, fixed for current gate)
         self._gate_ap       = None   # approach point [x,y,z] – 0.4m in front of gate
@@ -355,6 +348,10 @@ class MyAssignment:
         # Sub-phase within APPROACH: 0=fly-to-AP, 1=align-yaw, 2=through-gate
         self._ap_phase      = 0
         self._align_count   = 0
+
+        # Observation-wait tracking (phase 1 → phase 2 gate)
+        self._obs_last_n    = 0   # observation count the last time we checked
+        self._obs_stall_step = 0  # steps elapsed without a new observation while waiting
 
         # Smooth polynomial plan state
         self._plan_coeff    = None   # (3,6) 5th-order polynomial coefficients, or None
@@ -369,6 +366,13 @@ class MyAssignment:
         self._lap_spline_vel = None  # first derivative of _lap_spline
         self._lap_total_T    = 0.0   # period of one lap on the spline (s)
         self._lap_t_progress = 0.0   # current closest-point parameter along spline
+
+        # Pre-lap entry point: approach waypoint before gate 1 at spline-tangent angle
+        self._pre_lap_target = None  # np.array([x,y,z]) or None
+
+        # Gate knot times on the lap spline (t values where gate centres sit).
+        # Used to shrink lookahead near gates so corners are not cut.
+        self._lap_gate_knots = []    # list of float knot times (one per real gate)
 
     # ------------------------------------------------------------------
     # Detection
@@ -408,8 +412,6 @@ class MyAssignment:
                 print(f"[Gate {gate_num}] first detection  "
                       f"pos=({world_pos[0]:.2f},{world_pos[1]:.2f},{world_pos[2]:.2f})  "
                       f"area={area:.0f}px²")
-                if gate_num == NUM_GATES:
-                    _save_results(self._gates)
             else:
                 g = self._gates[idx]
                 g['observations'].append((world_pos.copy(), area))
@@ -422,78 +424,18 @@ class MyAssignment:
                 if area > g['best_area']:
                     g['best_area'] = area
                     self._save_image(bgr, corners, g['pos'], gate_num)
-                if len(self._gates) == NUM_GATES:
-                    _save_results(self._gates)
 
     # ------------------------------------------------------------------
     # Navigation helpers
     # ------------------------------------------------------------------
 
     def _nearest_unvisited(self, drone_xy):
-        """
-        Return the index of the next gate to target in CCW order, or None.
-
-        After the first gate is passed the method uses the drone's current global
-        position to enforce a single-sector lookahead:
-
-          gate_advance  = CCW angle from last-passed-gate to candidate
-          drone_advance = CCW angle from last-passed-gate to drone's current position
-
-        A candidate is accepted only when:
-          gate_advance  ≤  drone_advance + sector_size          (primary)
-
-        This rejects a gate that is more than one sector ahead of where the drone
-        currently is, preventing a gate that is two CCW slots away from being
-        targeted before the closer (undetected) intermediate gate is found.
-
-        After SECTOR_FALLBACK_STEPS search steps without any valid target the
-        window relaxes to SECTOR_WIDE_DEG so the drone recovers from layouts
-        where the true next gate genuinely has an above-average angular gap.
-
-        Among all passing candidates the one with the smallest CCW advance is
-        returned – strict ordering regardless of physical distance.
-        """
+        """Return the nearest unvisited detected gate, or None."""
         unvisited = [i for i in range(len(self._gates)) if i not in self._gates_passed]
         if not unvisited:
             return None
-
-        sector_rad  = 2.0 * np.pi / NUM_GATES   # one sector ≈ 72° for N=5
-        lo          = np.radians(SECTOR_MIN_DEG)
-
-        # Reference angle for the CCW ordering constraint.
-        # After the first gate: use that gate's angular position.
-        # Before any gate is passed: use the drone's own angular position so the
-        # sector window is anchored at the drone rather than skipped entirely.
-        # This prevents targeting a gate that is angularly "behind" the drone
-        # (e.g. gate 5 when gate 1 is the natural next CCW gate).
-        drone_angle = float(np.arctan2(drone_xy[1] - ARENA_CENTER[1],
-                                       drone_xy[0] - ARENA_CENTER[0]))
-        ref_angle   = self._last_gate_angle if self._last_gate_angle is not None else drone_angle
-
-        # Drone's CCW advance from the reference angle (0 when ref = drone position)
-        drone_advance = (drone_angle - ref_angle) % (2.0 * np.pi)
-
-        # Primary: gate must be within one sector ahead of the drone's position
-        hi_primary = drone_advance + sector_rad
-        # Fallback: after extended search use the wide fixed window
-        hi_fallback = np.radians(SECTOR_WIDE_DEG)
-        use_fallback = self._search_steps_no_target >= SECTOR_FALLBACK_STEPS
-        hi = hi_fallback if use_fallback else hi_primary
-
-        candidates = []
-        for i in unvisited:
-            pos     = self._gates[i]['pos']
-            angle   = float(np.arctan2(pos[1] - ARENA_CENTER[1],
-                                       pos[0] - ARENA_CENTER[0]))
-            advance = (angle - ref_angle) % (2.0 * np.pi)
-            if lo <= advance <= hi:
-                candidates.append((i, advance))
-
-        if not candidates:
-            return None
-
-        # Strict CCW ordering: pick smallest advance (not nearest by distance)
-        return min(candidates, key=lambda x: x[1])[0]
+        return min(unvisited,
+                   key=lambda i: float(np.linalg.norm(drone_xy - self._gates[i]['pos'][:2])))
 
     def _plan_to_gate(self, gate_idx, drone_xyz):
         """
@@ -532,6 +474,8 @@ class MyAssignment:
         self._gate_yaw   = float(np.arctan2(d_hat[1], d_hat[0]))
         self._ap_phase   = 0
         self._align_count = 0
+        self._obs_last_n  = 0
+        self._obs_stall_step = 0
 
         # Fit initial polynomial from current drone position (at rest) to AP.
         self._plan_coeff  = _poly5_fit(
@@ -585,6 +529,19 @@ class MyAssignment:
             z = float(gate_pos[2]) if not np.isnan(float(gate_pos[2])) else CRUISE_Z
             waypoints.append(np.array([float(gate_pos[0]), float(gate_pos[1]), z]))
 
+        # Insert a mid-arc waypoint on the closing segment (last gate → first gate)
+        # to soften the entry angle on the spline seam and avoid steep gate misses.
+        p_last  = waypoints[-1]
+        p_first = waypoints[0]
+        ang_last  = float(np.arctan2(p_last[1]  - ARENA_CENTER[1], p_last[0]  - ARENA_CENTER[0]))
+        ang_first = float(np.arctan2(p_first[1] - ARENA_CENTER[1], p_first[0] - ARENA_CENTER[0]))
+        ang_mid   = ang_last + _angle_wrap(ang_first - ang_last) * 0.5
+        r_mid     = (float(np.linalg.norm(p_last[:2]  - ARENA_CENTER)) +
+                     float(np.linalg.norm(p_first[:2] - ARENA_CENTER))) / 2.0
+        z_mid     = (float(p_last[2]) + float(p_first[2])) / 2.0
+        mid_xy    = ARENA_CENTER + r_mid * np.array([np.cos(ang_mid), np.sin(ang_mid)])
+        waypoints.append(np.array([mid_xy[0], mid_xy[1], z_mid]))
+
         N = len(waypoints)
         if N < 2:
             return
@@ -613,7 +570,7 @@ class MyAssignment:
         self._plan_T      = init_T
         self._last_replan = self._sim_time
 
-        print(f"[Nav] cubic spline: {N} gate-centre knots, total_T={self._lap_total_T:.1f}s")
+        print(f"[Nav] cubic spline: {N} knots ({N-1} gates + 1 seam), total_T={self._lap_total_T:.1f}s")
         self._plot_lap_spline(waypoints, start_xyz)
 
     def _plot_lap_spline(self, waypoints, start_xyz):
@@ -659,6 +616,23 @@ class MyAssignment:
         # ── DONE ──────────────────────────────────────────────────────────
         if self._nav_state == self._S_DONE:
             return [drone_xyz[0], drone_xyz[1], CRUISE_Z, yaw]
+
+        # ── PRE_LAP: fly to gate-1 entry point before starting spline tracking ──
+        if self._nav_state == self._S_PRE_LAP:
+            if self._pre_lap_target is not None:
+                dist = float(np.linalg.norm(drone_xyz - self._pre_lap_target))
+                if dist < 0.4:
+                    # Close enough — hand off to spline tracking
+                    self._lap_t_progress = 0.0
+                    self._nav_state = self._S_LAP
+                    print("[Nav] PRE_LAP reached → LAP")
+                else:
+                    if self._sim_time - self._last_replan > REPLAN_INTERVAL:
+                        self._replan_to(self._pre_lap_target,
+                                        duration=max(1.0, dist / 1.5))
+                    tau = self._sim_time - self._plan_t0
+                    sp, _, _ = _poly5_eval(self._plan_coeff, tau, self._plan_T)
+                    return [float(sp[0]), float(sp[1]), float(sp[2]), yaw]
 
         # ── LAP: continuously-updated closest-point tracking on cubic spline ──
         if self._nav_state == self._S_LAP:
@@ -748,30 +722,73 @@ class MyAssignment:
 
             # ── Phase 1: hold at AP, align yaw, wait until settled ─────────
             if self._ap_phase == 1:
+                # Continue refining the AP while the drone hovers – gate position
+                # estimates keep improving as more observations accumulate.
+                # If the AP shifts significantly, reset the counter so the drone
+                # must re-settle at the updated position before flying through.
+                gate_pos_1 = self._gates[self._target_gate]['pos']
+                z_new_1    = float(gate_pos_1[2]) if not np.isnan(float(gate_pos_1[2])) else CRUISE_Z
+                ap_xy_new  = gate_pos_1[:2] - self._gate_d_hat * APPROACH_DIST
+                ap_shift   = float(np.linalg.norm(ap_xy_new - self._gate_ap[:2]))
+                if ap_shift > 0.05:
+                    self._gate_ap  = np.array([ap_xy_new[0], ap_xy_new[1], z_new_1])
+                    self._gate_past = np.array([
+                        gate_pos_1[0] + self._gate_d_hat[0] * PAST_DIST,
+                        gate_pos_1[1] + self._gate_d_hat[1] * PAST_DIST,
+                        z_new_1,
+                    ])
+                    self._align_count = 0   # must re-settle at the new position
+                    ap_xy = self._gate_ap[:2]
+                    ap_z  = float(self._gate_ap[2])
+
                 yaw_err = _angle_wrap(self._gate_yaw - yaw)
                 yaw_cmd = yaw + float(np.clip(yaw_err, -YAW_RATE_MAX, YAW_RATE_MAX))
 
-                # Only count steps where drone is on-target in BOTH position and
-                # yaw; any drift resets the counter so we never fly through the
-                # gate unless the drone is truly settled on the gate normal.
-                pos_err = float(np.linalg.norm(drone_xy - ap_xy))
-                if pos_err < ALIGN_TOL and abs(yaw_err) < YAW_TOL:
+                # Require 3-D proximity (XY + Z) and yaw alignment.  Using 3-D
+                # distance prevents the drone from counting steps where it is at
+                # the right XY position but still at the wrong height.
+                dist_3d = float(np.linalg.norm(
+                    drone_xyz - np.array([ap_xy[0], ap_xy[1], ap_z])
+                ))
+                if dist_3d < ALIGN_TOL and abs(yaw_err) < YAW_TOL:
                     self._align_count += 1
                 else:
                     self._align_count = 0
 
-                if self._align_count >= ALIGN_STEPS:
+                n_obs = len(self._gates[self._target_gate]['observations'])
+                if self._align_count >= ALIGN_STEPS and n_obs >= MIN_GATE_OBS:
                     self._ap_phase = 2
-                    # Fit a new polynomial from AP straight through to past point.
-                    # Starts at rest (v=0, a=0) so the drone launches smoothly.
+                    # Start the through-gate polynomial from the drone's ACTUAL
+                    # current position (not the stored gate_ap) so the trajectory
+                    # launches cleanly from wherever the drone has settled.
                     self._plan_coeff = _poly5_fit(
-                        self._gate_ap, np.zeros(3), np.zeros(3),
+                        drone_xyz, np.zeros(3), np.zeros(3),
                         self._gate_past, np.zeros(3), np.zeros(3),
                         T_THROUGH,
                     )
                     self._plan_t0 = self._sim_time
                     self._plan_T  = T_THROUGH
-                    print(f"[Nav] gate {self._target_gate + 1} aligned → THROUGH")
+                    print(f"[Nav] gate {self._target_gate + 1} aligned → THROUGH"
+                          f"  ({n_obs} obs)")
+                elif self._align_count >= ALIGN_STEPS:
+                    # Settled but not enough observations yet.
+                    # If observations have stopped arriving (gate not in view),
+                    # sweep yaw left and right until the gate becomes visible again.
+                    if n_obs > self._obs_last_n:
+                        self._obs_last_n     = n_obs
+                        self._obs_stall_step = 0
+                    else:
+                        self._obs_stall_step += 1
+
+                    if self._obs_stall_step > OBS_STALL_STEPS:
+                        # Override yaw_cmd with a sinusoidal sweep around gate_yaw
+                        sweep_yaw = self._gate_yaw + OBS_YAW_AMP * np.sin(
+                            self._obs_stall_step * OBS_YAW_SPEED
+                        )
+                        sweep_err = _angle_wrap(sweep_yaw - yaw)
+                        yaw_cmd   = yaw + float(np.clip(sweep_err,
+                                                        -YAW_RATE_MAX * 2,
+                                                         YAW_RATE_MAX * 2))
 
                 return [float(ap_xy[0]), float(ap_xy[1]), ap_z, yaw_cmd]
 
@@ -785,43 +802,96 @@ class MyAssignment:
                 proj = float(np.dot(drone_xy - gate_pos[:2], self._gate_d_hat))
 
                 if proj >= PAST_DIST * 0.7 or tau >= self._plan_T:
-                    # Record the angle of this gate so CCW ordering can find the next
-                    gp = self._gates[self._target_gate]['pos']
-                    self._last_gate_angle = float(
-                        np.arctan2(gp[1] - ARENA_CENTER[1], gp[0] - ARENA_CENTER[0])
-                    )
                     self._gates_order.append(self._target_gate)
                     self._gates_passed.add(self._target_gate)
                     print(f"[Nav] gate {self._target_gate + 1} passed "
                           f"({len(self._gates_passed)}/{NUM_GATES})")
                     if len(self._gates_passed) >= NUM_GATES:
+                        _save_results(self._gates, self._gates_order)
                         self._build_lap_spline(drone_xyz)
-                        self._nav_state = self._S_LAP
-                        print("[Nav] all gates passed → LAP")
+                        # Compute a pre-lap entry waypoint: APPROACH_DIST behind gate 1
+                        # along the reversed spline tangent at t=0 so the drone arrives
+                        # at gate 1 already aligned with the racing line.
+                        sp0 = self._lap_spline(0.0)
+                        sv0 = self._lap_spline_vel(0.0)
+                        sv0_norm = float(np.linalg.norm(sv0[:2]))
+                        if sv0_norm > 0.01:
+                            entry_dir = sv0[:2] / sv0_norm          # unit vec of spline at gate 1
+                        else:
+                            entry_dir = np.array([1.0, 0.0])
+                        PRE_LAP_DIST = 1.5   # metres before gate 1 along approach direction
+                        pre_xy = sp0[:2] - entry_dir * PRE_LAP_DIST
+                        _xy_lo = ARENA_MARGIN; _xy_hi = 8.0 - ARENA_MARGIN
+                        pre_xy = np.clip(pre_xy, _xy_lo, _xy_hi)
+                        self._pre_lap_target = np.array([pre_xy[0], pre_xy[1], float(sp0[2])])
+                        self._nav_state = self._S_PRE_LAP
+                        self._replan_to(self._pre_lap_target,
+                                        duration=max(1.5, float(np.linalg.norm(drone_xyz - self._pre_lap_target)) / 1.5))
+                        print(f"[Nav] all gates passed → PRE_LAP entry {self._pre_lap_target}")
                         return [drone_xyz[0], drone_xyz[1], CRUISE_Z, yaw]
-                    self._nav_state  = self._S_SEARCH
-                    self._search_yaw = yaw
-                    self._search_step = 0
-                    # Step right of travel direction so the next gate enters camera view
-                    right = np.array([self._gate_d_hat[1], -self._gate_d_hat[0]])
-                    side_xy = drone_xy + right * SIDE_STEP_DIST
-                    self._search_side_target = np.array([
-                        float(side_xy[0]), float(side_xy[1]),
-                        float(self._gate_ap[2]),
-                    ])
-                    self._search_steps_no_target = 0
-                    print("[Nav] → SEARCH (side-step)")
-                    # fall through to SEARCH
+                    # Build SIDE_STEP_SEGS equally-spaced waypoints 2 m in a direction
+                    # 60° to the right of the CCW tangent at the drone's current arena
+                    # position.  The tangent (circuit forward direction) is computed from
+                    # the drone's radial position relative to ARENA_CENTER, so the
+                    # movement is independent of the drone's actual heading.
+                    _radial   = drone_xy - ARENA_CENTER
+                    _r_len    = float(np.linalg.norm(_radial))
+                    _r_hat    = _radial / _r_len if _r_len > 0.1 else np.array([1.0, 0.0])
+                    _t_hat    = np.array([-_r_hat[1], _r_hat[0]])   # CCW tangent = circuit forward
+                    move_angle = np.arctan2(_t_hat[1], _t_hat[0]) - np.radians(60)
+                    move_dir   = np.array([np.cos(move_angle), np.sin(move_angle)])
+                    _xy_lo = ARENA_MARGIN
+                    _xy_hi = 8.0 - ARENA_MARGIN
+                    self._side_step_wps = [
+                        np.array([
+                            float(np.clip(drone_xyz[0] + move_dir[0] * SIDE_STEP_DIST * k / SIDE_STEP_SEGS,
+                                          _xy_lo, _xy_hi)),
+                            float(np.clip(drone_xyz[1] + move_dir[1] * SIDE_STEP_DIST * k / SIDE_STEP_SEGS,
+                                          _xy_lo, _xy_hi)),
+                            float(drone_xyz[2]),
+                        ])
+                        for k in range(1, SIDE_STEP_SEGS + 1)
+                    ]
+                    self._side_step_idx = 0
+                    self._nav_state = self._S_SIDE_STEP
+                    print("[Nav] → SIDE_STEP")
+                    # fall through to SIDE_STEP
                 else:
                     return [float(sp[0]), float(sp[1]), float(sp[2]), self._gate_yaw]
 
-        # ── SEARCH: look for next gate in CCW order ───────────────────────
+        # ── SIDE_STEP: smooth C2-continuous movement through waypoints ────
+        if self._nav_state == self._S_SIDE_STEP:
+            target = self._side_step_wps[self._side_step_idx]
+
+            # Advance to the next waypoint when close enough
+            if float(np.linalg.norm(drone_xy - target[:2])) < SIDE_STEP_TOL:
+                self._side_step_idx += 1
+                if self._side_step_idx >= len(self._side_step_wps):
+                    self._nav_state   = self._S_SEARCH
+                    self._search_yaw  = yaw
+                    self._search_step = 0
+                    print("[Nav] side-step complete → SEARCH")
+                    # fall through to SEARCH
+                else:
+                    target = self._side_step_wps[self._side_step_idx]
+
+            if self._nav_state == self._S_SIDE_STEP:
+                # Same continuous replanning as approach phase 0: fire every
+                # REPLAN_INTERVAL, sample T_REPLAN_BUF ahead on the current
+                # polynomial for C2 continuity, replan toward current waypoint.
+                if self._sim_time - self._last_replan > REPLAN_INTERVAL:
+                    dist = float(np.linalg.norm(drone_xyz - target))
+                    self._replan_to(target, duration=max(SIDE_STEP_DUR, dist / 1.5))
+
+                tau = self._sim_time - self._plan_t0
+                sp, _, _ = _poly5_eval(self._plan_coeff, tau, self._plan_T)
+                return [float(sp[0]), float(sp[1]), float(sp[2]), yaw]
+
+        # ── SEARCH: rotate in place until a gate is detected ─────────────
         if self._nav_state == self._S_SEARCH:
             next_gate = self._nearest_unvisited(drone_xy)
             if next_gate is not None:
-                self._target_gate            = next_gate
-                self._search_steps_no_target = 0
-                self._search_side_target     = None
+                self._target_gate = next_gate
                 self._plan_to_gate(next_gate, drone_xyz)
                 self._nav_state = self._S_APPROACH
                 print(f"[Nav] target gate {next_gate + 1} → APPROACH")
@@ -829,24 +899,10 @@ class MyAssignment:
                 sp, _, _ = _poly5_eval(self._plan_coeff, tau, self._plan_T)
                 return [float(sp[0]), float(sp[1]), float(sp[2]), self._gate_yaw]
 
-            # No qualifying gate found yet – rotate camera while moving/hovering.
+            # No gate detected yet – rotate in place with a gentle Z oscillation.
             self._search_yaw  += SEARCH_YAW_RATE
             self._search_step += 1
             z_sp = CRUISE_Z + SEARCH_Z_AMP * np.sin(self._search_step * SEARCH_Z_RATE)
-
-            # Phase A: brief rightward step after gate pass to open camera angle.
-            # Do NOT fly CCW (sector-flying): that grows drone_advance and widens
-            # the acceptance window, letting a gate two slots ahead slip through.
-            if self._search_side_target is not None:
-                dist = float(np.linalg.norm(drone_xy - self._search_side_target[:2]))
-                if dist > SIDE_STEP_TOL:
-                    return [self._search_side_target[0],
-                            self._search_side_target[1],
-                            z_sp, self._search_yaw]
-                self._search_side_target = None   # arrived – switch to rotate-in-place
-
-            # Phase B: rotate in place; increment no-target counter for fallback.
-            self._search_steps_no_target += 1
             return [drone_xyz[0], drone_xyz[1], z_sp, self._search_yaw]
 
         # Fallback
@@ -941,8 +997,14 @@ def _spline_plot_process(curve, waypoints, gate_centres, start_xyz):
     plt.show()   # blocks until the window is closed; fine in a daemon process
 
 
-def _save_results(gates):
-    """Write estimated vs ground-truth gate positions to _RESULTS_FILE."""
+def _save_results(gates, gates_order):
+    """Write estimated vs ground-truth gate positions to _RESULTS_FILE.
+
+    Gates are listed in the order they were passed through (gates_order),
+    so Gate 1 in the output is the first gate the drone flew through, etc.
+    Truth matching uses the detection index (gate_idx) which corresponds to
+    the Webots GATE0–GATE4 definition order.
+    """
     import json
 
     truth = []
@@ -952,11 +1014,12 @@ def _save_results(gates):
 
     lines = ['Gate  |   Estimated (x, y, z)          |   Ground truth (x, y, z)       |  Error (m)  |  Obs',
              '-' * 100]
-    for i, g in enumerate(gates):
+    for pass_num, gate_idx in enumerate(gates_order):
+        g       = gates[gate_idx]
         est     = g['pos']
         est_str = f'({est[0]:6.3f}, {est[1]:6.3f}, {est[2]:6.3f})'
-        if i < len(truth):
-            gt      = truth[i]
+        if gate_idx < len(truth):
+            gt      = truth[gate_idx]
             err     = float(np.linalg.norm(est - np.array([gt['x'], gt['y'], gt['z']])))
             gt_str  = f'({gt["x"]:6.3f}, {gt["y"]:6.3f}, {gt["z"]:6.3f})'
             err_str = f'{err:.3f}'
@@ -964,7 +1027,7 @@ def _save_results(gates):
             gt_str  = 'N/A'
             err_str = 'N/A'
         n_obs = len(g['observations'])
-        lines.append(f'  {i+1}   |  {est_str}  |  {gt_str}  |  {err_str:>9}  |  {n_obs} obs')
+        lines.append(f'  {pass_num+1}   |  {est_str}  |  {gt_str}  |  {err_str:>9}  |  {n_obs} obs')
 
     with open(_RESULTS_FILE, 'w') as f:
         f.write('\n'.join(lines) + '\n')
