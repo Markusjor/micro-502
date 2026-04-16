@@ -93,10 +93,15 @@ SIDE_STEP_DUR    = 1.2    # s – polynomial duration per waypoint segment
 # centres produces the smooth oval racing line naturally without any
 # artificial before/after tangent constraints.
 LAP_SEG_T        = 2.0    # s per gate-to-gate spline segment (spline parameterisation only)
-LAP_SPEED        = 6.0    # m/s target speed during laps 2/3 (raise for more risk/speed)
-LAP_LOOKAHEAD_T  = 0.8    # s of spline ahead to use as tracking target
+LAP_SPEED        = 6.0    # m/s fallback speed (used when velocity profile is unavailable)
+LAP_LOOKAHEAD_T  = 0.8    # s of spline ahead – fallback when velocity profile is unavailable
 LAP_POLY_MIN_T   = 0.15   # minimum polynomial duration for lap replans
 LAP_SEARCH_AHEAD = LAP_SEG_T * 1.5 # s of spline to search when projecting drone position
+# Curvature-adaptive velocity profile
+LAP_A_MAX            = 4.0   # m/s² – max centripetal/longitudinal accel for velocity profile
+LAP_V_MAX            = 8.0   # m/s – speed cap on straight sections
+LAP_V_MIN            = 2.0   # m/s – speed floor even in the tightest turns
+LAP_LOOKAHEAD_REAL_T = 0.45  # s  – real-flight-time lookahead horizon; scales with speed
 
 
 
@@ -374,6 +379,9 @@ class MyAssignment:
         # Used to shrink lookahead near gates so corners are not cut.
         self._lap_gate_knots = []    # list of float knot times (one per real gate)
 
+        # Curvature-adaptive velocity profile (built alongside _lap_spline)
+        self._v_profile_spline = None
+
     # ------------------------------------------------------------------
     # Detection
     # ------------------------------------------------------------------
@@ -571,7 +579,67 @@ class MyAssignment:
         self._last_replan = self._sim_time
 
         print(f"[Nav] cubic spline: {N} knots ({N-1} gates + 1 seam), total_T={self._lap_total_T:.1f}s")
+        self._build_velocity_profile()
         self._plot_lap_spline(waypoints, start_xyz)
+
+    def _build_velocity_profile(self):
+        """
+        Build a curvature-limited, trapezoidal velocity profile along the lap spline.
+
+        Algorithm (forward-backward pass / "trapezoidal profile"):
+          1. Sample curvature κ = |cs'×cs''| / |cs'|³ at N points.
+          2. v_curvature = sqrt(a_max / κ)  – centripetal limit at each sample.
+          3. Forward pass: limit each sample by the reachable speed from the
+             previous sample given a_max over the arc-length step.
+          4. Backward pass: same in reverse (deceleration).
+          5. The array is tripled before the passes so the periodic boundary is
+             handled correctly without a separate fixup.
+
+        Stores self._v_profile_spline: CubicSpline mapping spline-parameter t
+        → target flight speed (m/s).
+        """
+        N = 500
+        t_samp = np.linspace(0.0, self._lap_total_T, N, endpoint=False)
+        dt_samp = self._lap_total_T / N
+
+        d1 = self._lap_spline(t_samp, 1)   # (N, 3)  m / spline-s
+        d2 = self._lap_spline(t_samp, 2)   # (N, 3)
+
+        # κ = |d1 × d2| / |d1|³
+        cross  = np.cross(d1, d2)
+        d1_mag = np.linalg.norm(d1, axis=1)
+        kappa  = np.linalg.norm(cross, axis=1) / (d1_mag ** 3 + 1e-9)
+
+        # Curvature-limited speed, clamped to [LAP_V_MIN, LAP_V_MAX]
+        v_curv   = np.sqrt(np.maximum(LAP_A_MAX / (kappa + 1e-6), 0.0))
+        v_profile = np.clip(v_curv, LAP_V_MIN, LAP_V_MAX)
+
+        # Arc-length increment between consecutive samples (metres)
+        ds = d1_mag * dt_samp   # ds[i] ≈ arc length from t_samp[i] to t_samp[i+1]
+
+        # --- Trapezoidal passes on a tripled array (handles periodic BCs) ---
+        ds3 = np.tile(ds, 3)
+        v3  = np.tile(v_profile, 3)
+        M   = 3 * N
+
+        # Forward pass: v[i+1] ≤ sqrt(v[i]² + 2·a·ds[i])
+        for i in range(M - 1):
+            v_lim = np.sqrt(max(0.0, v3[i] ** 2 + 2.0 * LAP_A_MAX * ds3[i]))
+            if v3[i + 1] > v_lim:
+                v3[i + 1] = v_lim
+
+        # Backward pass: v[i] ≤ sqrt(v[i+1]² + 2·a·ds[i])
+        for i in range(M - 2, -1, -1):
+            v_lim = np.sqrt(max(0.0, v3[i + 1] ** 2 + 2.0 * LAP_A_MAX * ds3[i]))
+            if v3[i] > v_lim:
+                v3[i] = v_lim
+
+        # Middle period has both boundary conditions satisfied; re-apply floor
+        v_profile = np.clip(v3[N:2 * N], LAP_V_MIN, LAP_V_MAX)
+
+        self._v_profile_spline = CubicSpline(t_samp, v_profile, extrapolate=True)
+        print(f"[VProfile] speed: min={v_profile.min():.2f}  "
+              f"max={v_profile.max():.2f}  mean={v_profile.mean():.2f} m/s")
 
     def _plot_lap_spline(self, waypoints, start_xyz):
         """
@@ -652,18 +720,41 @@ class MyAssignment:
                 np.linspace(t_lo, t_hi, 60)[best] % self._lap_total_T
             )
 
-            # ── 2. Lookahead target on the spline ─────────────────────────────
-            t_ref   = (self._lap_t_progress + LAP_LOOKAHEAD_T) % self._lap_total_T
+            # ── 2. Adaptive speed and lookahead from curvature velocity profile ─
+            t_curr = self._lap_t_progress % self._lap_total_T
+            if self._v_profile_spline is not None:
+                v_target = float(np.clip(
+                    self._v_profile_spline(t_curr), LAP_V_MIN, LAP_V_MAX
+                ))
+            else:
+                v_target = LAP_SPEED
+
+            # Convert a fixed real-time lookahead (seconds) into spline-parameter
+            # seconds via the local spline speed |cs'(t)| (metres / spline-s).
+            # High speed on a straight → larger spline lookahead.
+            # Low speed in a tight turn → smaller spline lookahead.
+            spline_local_speed = float(np.linalg.norm(self._lap_spline_vel(t_curr)))
+            if spline_local_speed > 0.05:
+                lookahead_dist     = v_target * LAP_LOOKAHEAD_REAL_T   # metres
+                lookahead_spline_t = float(np.clip(
+                    lookahead_dist / spline_local_speed,
+                    0.15, LAP_SEARCH_AHEAD * 0.6,
+                ))
+            else:
+                lookahead_spline_t = LAP_LOOKAHEAD_T
+
+            # ── 3. Lookahead target on the spline ─────────────────────────────
+            t_ref   = (self._lap_t_progress + lookahead_spline_t) % self._lap_total_T
             ref_pos = self._lap_spline(t_ref)
             ref_vel = self._lap_spline_vel(t_ref)
 
-            # ── 3. Replan toward the (continuously updated) target ────────────
+            # ── 4. Replan toward the (continuously updated) target ────────────
             # Same mechanism as phase-0 approach on lap 1: _replan_to fires every
             # REPLAN_INTERVAL, samples the current polynomial T_REPLAN_BUF ahead
             # for C2 continuity, and fits a new polynomial to ref_pos / ref_vel.
             if self._sim_time - self._last_replan > REPLAN_INTERVAL:
                 dist_to_ref = float(np.linalg.norm(drone_xyz - ref_pos))
-                seg_T = max(LAP_POLY_MIN_T, dist_to_ref / LAP_SPEED)
+                seg_T = max(LAP_POLY_MIN_T, dist_to_ref / v_target)
                 self._replan_to(ref_pos, duration=seg_T, target_vel=ref_vel)
 
             tau = self._sim_time - self._plan_t0

@@ -17,7 +17,7 @@ import threading
 exp_num = 4                    # 0: Coordinate Transformation, 1: PID Tuning, 2: Kalman Filter, 3: Motion Planning, 4: Project
 control_style = 'path_planner'     # 'keyboard' or 'path_planner'
 rand_env = True                # Randomise the environment
-rand_seed = 107981625                # None = pick a fresh random seed each run;
+rand_seed = None                # None = pick a fresh random seed each run;
                                # set to an integer to replay a specific layout
 
 # Global variables for handling threads
