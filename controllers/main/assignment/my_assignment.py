@@ -99,9 +99,9 @@ LAP_POLY_MIN_T   = 0.15   # minimum polynomial duration for lap replans
 LAP_SEARCH_AHEAD = LAP_SEG_T * 1.5 # s of spline to search when projecting drone position
 # Curvature-adaptive velocity profile
 LAP_A_MAX            = 4.0   # m/s² – max centripetal/longitudinal accel for velocity profile
-LAP_V_MAX            = 8.0   # m/s – speed cap on straight sections
-LAP_V_MIN            = 2.0   # m/s – speed floor even in the tightest turns
-LAP_LOOKAHEAD_REAL_T = 0.45  # s  – real-flight-time lookahead horizon; scales with speed
+LAP_V_MAX            = 13.0  # m/s – speed cap on straight sections
+LAP_V_MIN            = 1.2   # m/s – speed floor even in the tightest turns
+LAP_LOOKAHEAD_REAL_T = 0.65  # s  – real-flight-time lookahead horizon; scales with speed
 
 
 
@@ -738,7 +738,7 @@ class MyAssignment:
                 lookahead_dist     = v_target * LAP_LOOKAHEAD_REAL_T   # metres
                 lookahead_spline_t = float(np.clip(
                     lookahead_dist / spline_local_speed,
-                    0.15, LAP_SEARCH_AHEAD * 0.6,
+                    0.15, LAP_SEARCH_AHEAD * 0.8,
                 ))
             else:
                 lookahead_spline_t = LAP_LOOKAHEAD_T
@@ -900,25 +900,32 @@ class MyAssignment:
                     if len(self._gates_passed) >= NUM_GATES:
                         _save_results(self._gates, self._gates_order)
                         self._build_lap_spline(drone_xyz)
-                        # Compute a pre-lap entry waypoint: APPROACH_DIST behind gate 1
-                        # along the reversed spline tangent at t=0 so the drone arrives
-                        # at gate 1 already aligned with the racing line.
-                        sp0 = self._lap_spline(0.0)
-                        sv0 = self._lap_spline_vel(0.0)
-                        sv0_norm = float(np.linalg.norm(sv0[:2]))
-                        if sv0_norm > 0.01:
-                            entry_dir = sv0[:2] / sv0_norm          # unit vec of spline at gate 1
-                        else:
-                            entry_dir = np.array([1.0, 0.0])
-                        PRE_LAP_DIST = 1.5   # metres before gate 1 along approach direction
-                        pre_xy = sp0[:2] - entry_dir * PRE_LAP_DIST
-                        _xy_lo = ARENA_MARGIN; _xy_hi = 8.0 - ARENA_MARGIN
-                        pre_xy = np.clip(pre_xy, _xy_lo, _xy_hi)
-                        self._pre_lap_target = np.array([pre_xy[0], pre_xy[1], float(sp0[2])])
-                        self._nav_state = self._S_PRE_LAP
-                        self._replan_to(self._pre_lap_target,
-                                        duration=max(1.5, float(np.linalg.norm(drone_xyz - self._pre_lap_target)) / 1.5))
-                        print(f"[Nav] all gates passed → PRE_LAP entry {self._pre_lap_target}")
+                        # Project the drone onto the nearest point of the full
+                        # spline so lap tracking starts from the current position
+                        # rather than flying back to gate 1 first.
+                        t_full   = np.linspace(0, self._lap_total_T, 300, endpoint=False)
+                        pts_full = self._lap_spline(t_full)
+                        best_idx = int(np.argmin(
+                            np.linalg.norm(pts_full - drone_xyz, axis=1)
+                        ))
+                        self._lap_t_progress = float(t_full[best_idx])
+                        # Seed the active polynomial toward a point one lookahead
+                        # ahead on the spline so the LAP state has a valid target.
+                        t_seed  = (self._lap_t_progress + LAP_LOOKAHEAD_T) % self._lap_total_T
+                        sp_seed = self._lap_spline(t_seed)
+                        sv_seed = self._lap_spline_vel(t_seed)
+                        d_seed  = float(np.linalg.norm(drone_xyz - sp_seed))
+                        self._plan_coeff  = _poly5_fit(
+                            drone_xyz, np.zeros(3), np.zeros(3),
+                            sp_seed, sv_seed, np.zeros(3),
+                            max(1.0, d_seed / LAP_SPEED),
+                        )
+                        self._plan_t0     = self._sim_time
+                        self._plan_T      = max(1.0, d_seed / LAP_SPEED)
+                        self._last_replan = self._sim_time
+                        self._nav_state   = self._S_LAP
+                        print(f"[Nav] all gates passed → LAP  "
+                              f"t_progress={self._lap_t_progress:.2f}")
                         return [drone_xyz[0], drone_xyz[1], CRUISE_Z, yaw]
                     # Build SIDE_STEP_SEGS equally-spaced waypoints 2 m in a direction
                     # 60° to the right of the CCW tangent at the drone's current arena
