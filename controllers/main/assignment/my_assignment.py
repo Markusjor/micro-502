@@ -2,7 +2,7 @@ import os
 
 import cv2
 import numpy as np
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import CubicSpline, CubicHermiteSpline
 
 # ---------------------------------------------------------------------------
 # Output directory
@@ -98,6 +98,8 @@ LAP_A_MAX            = 2.0   # m/s^2 - max centripetal/longitudinal accel for ve
 LAP_V_MAX            = 2.0   # m/s - speed cap; matched to PID L_vel_xy limit
 LAP_V_MIN            = 0.8   # m/s - speed floor even in the tightest turns
 LAP_LOOKAHEAD_REAL_T = 1.30  # s - real-flight-time lookahead horizon; scales with speed
+LAP_GATE_OFFSET      = 0.5   # m - entry/exit waypoints this far from gate centre along approach axis
+LAP_GATE_TRIGGER_DIST = 2.0  # m - radius around each gate at which the tracker overrides the lookahead
 
 
 # ---------------------------------------------------------------------------
@@ -486,38 +488,60 @@ class MyAssignment:
 
     def _build_lap_spline(self, start_xyz):
         """
-        Fit a periodic cubic spline through the gate centres in pass order.
-
-        An extra mid-arc knot is inserted on the closing segment (last gate ->
-        first gate) to soften the entry angle at the spline seam.
+        Fit a CubicHermiteSpline through entry, gate centre, and exit waypoints for
+        each gate in pass order.  Tangents at all three points are explicitly set to
+        the CCW approach direction (d_hat), so the spline is guaranteed to pass through
+        every gate at the correct heading regardless of adjacent gate positions.
+        Arc-length parameterization is used so the tangent magnitudes are consistent
+        with the physical speed of travel.
         """
-        waypoints = []
+        positions     = []
+        tangent_units = []   # unit direction vectors; scaled after arc length is known
+
         for gate_idx in self._gates_order:
             gate_pos = self._gates[gate_idx]['pos']
-            z = float(gate_pos[2]) if not np.isnan(float(gate_pos[2])) else CRUISE_Z
-            waypoints.append(np.array([float(gate_pos[0]), float(gate_pos[1]), z]))
+            z   = float(gate_pos[2]) if not np.isnan(float(gate_pos[2])) else CRUISE_Z
+            gxy = np.array([float(gate_pos[0]), float(gate_pos[1])])
 
-        p_last  = waypoints[-1]
-        p_first = waypoints[0]
-        ang_last  = float(np.arctan2(p_last[1]  - ARENA_CENTER[1], p_last[0]  - ARENA_CENTER[0]))
-        ang_first = float(np.arctan2(p_first[1] - ARENA_CENTER[1], p_first[0] - ARENA_CENTER[0]))
-        ang_mid   = ang_last + _angle_wrap(ang_first - ang_last) * 0.5
-        r_mid     = (float(np.linalg.norm(p_last[:2]  - ARENA_CENTER)) +
-                     float(np.linalg.norm(p_first[:2] - ARENA_CENTER))) / 2.0
-        z_mid     = (float(p_last[2]) + float(p_first[2])) / 2.0
-        mid_xy    = ARENA_CENTER + r_mid * np.array([np.cos(ang_mid), np.sin(ang_mid)])
-        waypoints.append(np.array([mid_xy[0], mid_xy[1], z_mid]))
+            radial = gxy - ARENA_CENTER
+            r_len  = float(np.linalg.norm(radial))
+            d_hat  = (np.array([-radial[1], radial[0]]) / r_len
+                      if r_len > 0.2 else np.array([1.0, 0.0]))
+            d3 = np.array([d_hat[0], d_hat[1], 0.0])
 
-        N = len(waypoints)
-        if N < 2:
+            entry = np.array([gxy[0] - d_hat[0] * LAP_GATE_OFFSET,
+                               gxy[1] - d_hat[1] * LAP_GATE_OFFSET, z])
+            gate  = np.array([gxy[0], gxy[1], z])
+            exit_ = np.array([gxy[0] + d_hat[0] * LAP_GATE_OFFSET,
+                               gxy[1] + d_hat[1] * LAP_GATE_OFFSET, z])
+
+            positions.extend([entry, gate, exit_])
+            tangent_units.extend([d3, d3, d3])
+
+        if len(positions) < 2:
             return
 
-        t_knots = np.arange(N + 1) * LAP_SEG_T
-        pts     = np.vstack(waypoints + [waypoints[0]])   # close the loop
+        # Close the loop: repeat first point and tangent so the Hermite spline
+        # is C1-continuous at the seam.
+        positions.append(positions[0])
+        tangent_units.append(tangent_units[0])
 
-        self._lap_spline     = CubicSpline(t_knots, pts, bc_type='periodic')
+        pts_arr = np.array(positions)
+
+        # Arc-length-proportional time knots, scaled to n_gates * LAP_SEG_T.
+        seg_lens  = np.linalg.norm(np.diff(pts_arr, axis=0), axis=1)
+        total_arc = float(np.sum(seg_lens))
+        t_knots   = np.concatenate([[0.0], np.cumsum(seg_lens)])
+        total_T   = len(self._gates_order) * LAP_SEG_T
+        t_knots   = t_knots * (total_T / total_arc)
+
+        # Scale unit tangents: dpos/dt = d_hat * (total_arc / total_T).
+        tan_scale     = total_arc / total_T
+        tangents_arr  = np.array(tangent_units) * tan_scale
+
+        self._lap_spline     = CubicHermiteSpline(t_knots, pts_arr, tangents_arr)
         self._lap_spline_vel = self._lap_spline.derivative()
-        self._lap_total_T    = float(N * LAP_SEG_T)
+        self._lap_total_T    = total_T
         self._lap_t_progress = 0.0
 
         sv0    = self._lap_spline_vel(0.0)
@@ -533,8 +557,77 @@ class MyAssignment:
         self._plan_T      = init_T
         self._last_replan = self._sim_time
 
+        N = len(positions) - 1   # exclude closing duplicate
         print(f"[Nav] lap spline: {N} knots, total_T={self._lap_total_T:.1f}s")
         self._build_velocity_profile()
+        self._plot_lap_spline()
+
+    def _plot_lap_spline(self):
+        """Save a 3-D plot of the lap spline and gate positions to a PNG file."""
+        import multiprocessing
+
+        t_dense = np.linspace(0.0, self._lap_total_T, 400, endpoint=False)
+        path    = self._lap_spline(t_dense)
+
+        gate_centres = []
+        gate_entries = []
+        gate_exits   = []
+        for gate_idx in self._gates_order:
+            gp  = self._gates[gate_idx]['pos']
+            gxy = np.array([float(gp[0]), float(gp[1])])
+            z   = float(gp[2]) if not np.isnan(float(gp[2])) else CRUISE_Z
+            rad = gxy - ARENA_CENTER
+            r_len = float(np.linalg.norm(rad))
+            d_hat = (np.array([-rad[1], rad[0]]) / r_len
+                     if r_len > 0.2 else np.array([1.0, 0.0]))
+            gate_centres.append([gxy[0], gxy[1], z])
+            gate_entries.append([gxy[0] - d_hat[0] * LAP_GATE_OFFSET,
+                                  gxy[1] - d_hat[1] * LAP_GATE_OFFSET, z])
+            gate_exits.append([gxy[0]   + d_hat[0] * LAP_GATE_OFFSET,
+                                gxy[1]  + d_hat[1] * LAP_GATE_OFFSET, z])
+
+        data = {
+            'path':    path,
+            'centres': np.array(gate_centres),
+            'entries': np.array(gate_entries),
+            'exits':   np.array(gate_exits),
+            'out':     os.path.join(_PROJECT_DIR, 'lap_spline.png'),
+        }
+
+        def _render(data):
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+            fig = plt.figure(figsize=(9, 7))
+            ax  = fig.add_subplot(111, projection='3d')
+
+            p = data['path']
+            ax.plot(p[:, 0], p[:, 1], p[:, 2], 'b-', lw=1.5, label='spline')
+
+            c = data['centres']
+            ax.scatter(c[:, 0], c[:, 1], c[:, 2], c='red', s=80, zorder=5, label='gate centre')
+
+            e = data['entries']
+            ax.scatter(e[:, 0], e[:, 1], e[:, 2], c='orange', s=40, marker='^', label='entry')
+
+            x = data['exits']
+            ax.scatter(x[:, 0], x[:, 1], x[:, 2], c='green',  s=40, marker='v', label='exit')
+
+            for i, pt in enumerate(c):
+                ax.text(pt[0], pt[1], pt[2], f' {i+1}', fontsize=9)
+
+            ax.set_xlabel('x (m)'); ax.set_ylabel('y (m)'); ax.set_zlabel('z (m)')
+            ax.set_xlim(0, 8); ax.set_ylim(0, 8)
+            ax.set_title('Lap spline (3-D)')
+            ax.legend(loc='upper right')
+            fig.tight_layout()
+            fig.savefig(data['out'], dpi=120)
+            plt.close(fig)
+
+        p = multiprocessing.Process(target=_render, args=(data,), daemon=True)
+        p.start()
 
     def _build_velocity_profile(self):
         """
@@ -627,6 +720,28 @@ class MyAssignment:
             t_ref   = (self._lap_t_progress + lookahead_spline_t) % self._lap_total_T
             ref_pos = self._lap_spline(t_ref)
             ref_vel = self._lap_spline_vel(t_ref)
+
+            # Gate-centre override: when approaching any gate within the trigger radius,
+            # replace the lookahead with a sliding target ahead of the drone along the
+            # gate axis, locked to the gate z.  The target always stays LAP_GATE_OFFSET
+            # ahead of the drone so the drone never catches it and oscillates.
+            # Override stays active until the drone is 3x LAP_GATE_OFFSET past the gate.
+            for _gidx in self._gates_order:
+                _gpos = self._gates[_gidx]['pos']
+                _gxy  = _gpos[:2]
+                _gz   = float(_gpos[2]) if not np.isnan(float(_gpos[2])) else CRUISE_Z
+                _rad  = _gxy - ARENA_CENTER
+                _rlen = float(np.linalg.norm(_rad))
+                _dhat = (np.array([-_rad[1], _rad[0]]) / _rlen
+                         if _rlen > 0.2 else np.array([1.0, 0.0]))
+                _proj = float(np.dot(drone_xy - _gxy, _dhat))
+                _dist = float(np.linalg.norm(drone_xy - _gxy))
+                if _dist < LAP_GATE_TRIGGER_DIST and _proj < LAP_GATE_OFFSET:
+                    _tgt_proj = max(LAP_GATE_OFFSET, _proj + LAP_GATE_OFFSET)
+                    _txy      = _gxy + _dhat * _tgt_proj
+                    ref_pos   = np.array([_txy[0], _txy[1], _gz])
+                    ref_vel   = np.array([_dhat[0] * v_target, _dhat[1] * v_target, 0.0])
+                    break
 
             if self._sim_time - self._last_replan > REPLAN_INTERVAL:
                 dist_to_ref = float(np.linalg.norm(drone_xyz - ref_pos))
