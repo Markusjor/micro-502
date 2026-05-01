@@ -361,6 +361,9 @@ class MyAssignment:
         # Curvature-adaptive velocity profile (built alongside _lap_spline)
         self._v_profile_spline = None
 
+        # Recorded drone positions during lap 1 (sampled every 0.10 m)
+        self._lap1_path = []
+
     # ------------------------------------------------------------------
     # Detection
     # ------------------------------------------------------------------
@@ -487,59 +490,31 @@ class MyAssignment:
         self._last_replan = self._sim_time
 
     def _build_lap_spline(self, start_xyz):
-        """
-        Fit a CubicHermiteSpline through entry, gate centre, and exit waypoints for
-        each gate in pass order.  Tangents at all three points are explicitly set to
-        the CCW approach direction (d_hat), so the spline is guaranteed to pass through
-        every gate at the correct heading regardless of adjacent gate positions.
-        Arc-length parameterization is used so the tangent magnitudes are consistent
-        with the physical speed of travel.
-        """
-        positions     = []
-        tangent_units = []   # unit direction vectors; scaled after arc length is known
-
-        for gate_idx in self._gates_order:
-            gate_pos = self._gates[gate_idx]['pos']
-            z   = float(gate_pos[2]) if not np.isnan(float(gate_pos[2])) else CRUISE_Z
-            gxy = np.array([float(gate_pos[0]), float(gate_pos[1])])
-
-            radial = gxy - ARENA_CENTER
-            r_len  = float(np.linalg.norm(radial))
-            d_hat  = (np.array([-radial[1], radial[0]]) / r_len
-                      if r_len > 0.2 else np.array([1.0, 0.0]))
-            d3 = np.array([d_hat[0], d_hat[1], 0.0])
-
-            entry = np.array([gxy[0] - d_hat[0] * LAP_GATE_OFFSET,
-                               gxy[1] - d_hat[1] * LAP_GATE_OFFSET, z])
-            gate  = np.array([gxy[0], gxy[1], z])
-            exit_ = np.array([gxy[0] + d_hat[0] * LAP_GATE_OFFSET,
-                               gxy[1] + d_hat[1] * LAP_GATE_OFFSET, z])
-
-            positions.extend([entry, gate, exit_])
-            tangent_units.extend([d3, d3, d3])
-
-        if len(positions) < 2:
+        """Build a periodic CubicSpline through the recorded lap-1 drone positions."""
+        pts = np.array(self._lap1_path)   # (N, 3)
+        if len(pts) < 4:
             return
 
-        # Close the loop: repeat first point and tangent so the Hermite spline
-        # is C1-continuous at the seam.
-        positions.append(positions[0])
-        tangent_units.append(tangent_units[0])
+        # Circular moving-average smooth (wrap-pad so the seam stays clean)
+        window = 7
+        half_w = window // 2
+        pts_pad = np.vstack([pts[-half_w:], pts, pts[:half_w]])
+        pts = np.column_stack([
+            np.convolve(pts_pad[:, d], np.ones(window) / window, mode='valid')
+            for d in range(3)
+        ])
 
-        pts_arr = np.array(positions)
+        # Arc-length-proportional time knots, scaled to n_gates * LAP_SEG_T
+        seg_lens   = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        close_dist = float(np.linalg.norm(pts[-1] - pts[0]))
+        all_lens   = np.append(seg_lens, close_dist)
+        total_arc  = float(np.sum(all_lens))
+        total_T    = float(len(self._gates_order)) * LAP_SEG_T
+        t_knots    = np.concatenate([[0.0], np.cumsum(all_lens)]) * (total_T / total_arc)
 
-        # Arc-length-proportional time knots, scaled to n_gates * LAP_SEG_T.
-        seg_lens  = np.linalg.norm(np.diff(pts_arr, axis=0), axis=1)
-        total_arc = float(np.sum(seg_lens))
-        t_knots   = np.concatenate([[0.0], np.cumsum(seg_lens)])
-        total_T   = len(self._gates_order) * LAP_SEG_T
-        t_knots   = t_knots * (total_T / total_arc)
+        pts_closed = np.vstack([pts, pts[0:1]])   # first point repeated to close loop
 
-        # Scale unit tangents: dpos/dt = d_hat * (total_arc / total_T).
-        tan_scale     = total_arc / total_T
-        tangents_arr  = np.array(tangent_units) * tan_scale
-
-        self._lap_spline     = CubicHermiteSpline(t_knots, pts_arr, tangents_arr)
+        self._lap_spline     = CubicSpline(t_knots, pts_closed, bc_type='periodic')
         self._lap_spline_vel = self._lap_spline.derivative()
         self._lap_total_T    = total_T
         self._lap_t_progress = 0.0
@@ -557,8 +532,7 @@ class MyAssignment:
         self._plan_T      = init_T
         self._last_replan = self._sim_time
 
-        N = len(positions) - 1   # exclude closing duplicate
-        print(f"[Nav] lap spline: {N} knots, total_T={self._lap_total_T:.1f}s")
+        print(f"[Nav] lap path: {len(pts)} waypoints, arc={total_arc:.1f}m, T={total_T:.1f}s")
         self._build_velocity_profile()
         self._plot_lap_spline()
 
@@ -721,11 +695,6 @@ class MyAssignment:
             ref_pos = self._lap_spline(t_ref)
             ref_vel = self._lap_spline_vel(t_ref)
 
-            # Gate-centre override: when approaching any gate within the trigger radius,
-            # replace the lookahead with a sliding target ahead of the drone along the
-            # gate axis, locked to the gate z.  The target always stays LAP_GATE_OFFSET
-            # ahead of the drone so the drone never catches it and oscillates.
-            # Override stays active until the drone is 3x LAP_GATE_OFFSET past the gate.
             for _gidx in self._gates_order:
                 _gpos = self._gates[_gidx]['pos']
                 _gxy  = _gpos[:2]
@@ -965,6 +934,15 @@ class MyAssignment:
         if sensor_data['z_global'] < 0.49:
             return [sensor_data['x_global'], sensor_data['y_global'],
                     1.0, sensor_data['yaw']]
+
+        # Record lap 1 path during approach and side-step only (not search wandering)
+        if self._nav_state in (self._S_APPROACH, self._S_SIDE_STEP):
+            p = np.array([sensor_data['x_global'],
+                          sensor_data['y_global'],
+                          sensor_data['z_global']])
+            if (not self._lap1_path or
+                    np.linalg.norm(p - self._lap1_path[-1]) > 0.20):
+                self._lap1_path.append(p)
 
         bgr = cv2.cvtColor(camera_data, cv2.COLOR_BGRA2BGR)
         self._update_detections(bgr, sensor_data)
