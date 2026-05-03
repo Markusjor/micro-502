@@ -597,16 +597,18 @@ class MyAssignment:
             if self._lap_spline is None:
                 return [drone_xyz[0], drone_xyz[1], CRUISE_Z, yaw]
 
+            # 1. Project drone onto spline (forward search only).
             t_lo      = self._lap_t_progress
             t_hi      = t_lo + LAP_SEARCH_AHEAD
-            t_samples = np.linspace(t_lo, t_hi, 60) % self._lap_total_T
-            pts       = self._lap_spline(t_samples)
+            t_samp    = np.linspace(t_lo, t_hi, 60) % self._lap_total_T
+            pts       = self._lap_spline(t_samp)
             best      = int(np.argmin(np.linalg.norm(pts - drone_xyz, axis=1)))
             self._lap_t_progress = float(
                 np.linspace(t_lo, t_hi, 60)[best] % self._lap_total_T
             )
+            t_curr = self._lap_t_progress
 
-            t_curr = self._lap_t_progress % self._lap_total_T
+            # 2. Target speed from curvature-adaptive profile.
             if self._v_profile_spline is not None:
                 v_target = float(np.clip(
                     self._v_profile_spline(t_curr), LAP_V_MIN, LAP_V_MAX
@@ -614,35 +616,47 @@ class MyAssignment:
             else:
                 v_target = LAP_SPEED
 
-            spline_local_speed = float(np.linalg.norm(self._lap_spline_vel(t_curr)))
-            if spline_local_speed > 0.05:
-                lookahead_dist     = v_target * LAP_LOOKAHEAD_REAL_T
+            # 3. Lookahead point: advance by a real-time horizon converted to
+            #    spline-time via the local spline speed |ds/dt|.
+            spline_speed = float(np.linalg.norm(self._lap_spline_vel(t_curr)))
+            if spline_speed > 0.05:
                 lookahead_spline_t = float(np.clip(
-                    lookahead_dist / spline_local_speed,
+                    v_target * LAP_LOOKAHEAD_REAL_T / spline_speed,
                     0.15, LAP_SEARCH_AHEAD * 0.8,
                 ))
             else:
                 lookahead_spline_t = LAP_LOOKAHEAD_T
-
-            t_ref   = (self._lap_t_progress + lookahead_spline_t) % self._lap_total_T
+            t_ref   = (t_curr + lookahead_spline_t) % self._lap_total_T
             ref_pos = self._lap_spline(t_ref)
-            ref_vel = self._lap_spline_vel(t_ref)
 
+            # 4. Feed-forward velocity: spline tangent at the lookahead point,
+            #    scaled to the target real-world speed.  ref_vel from the spline
+            #    is in spline-time units (m/spline-s), not m/s, so we normalise
+            #    it and multiply by v_target to get the correct m/s vector.
+            ref_vel_spline = self._lap_spline_vel(t_ref)
+            ref_speed      = float(np.linalg.norm(ref_vel_spline))
+            if ref_speed > 0.05:
+                ff_vel = ref_vel_spline * (v_target / ref_speed)
+            else:
+                ff_vel = np.zeros(3)
+
+            # 5. Replan polynomial with feed-forward terminal velocity.
             if self._sim_time - self._last_replan > REPLAN_INTERVAL:
                 dist_to_ref = float(np.linalg.norm(drone_xyz - ref_pos))
                 seg_T = max(LAP_POLY_MIN_T, dist_to_ref / v_target)
-                self._replan_to(ref_pos, duration=seg_T, target_vel=ref_vel)
+                self._replan_to(ref_pos, duration=seg_T, target_vel=ff_vel)
 
             tau = self._sim_time - self._plan_t0
             sp, vel, _ = _poly5_eval(self._plan_coeff, tau, self._plan_T)
 
-            # Yaw from polynomial velocity; fall back to spline tangent when slow.
+            # 6. Yaw from polynomial velocity; fall back to feed-forward when slow.
             vx, vy = float(vel[0]), float(vel[1])
             if abs(vx) > 0.05 or abs(vy) > 0.05:
                 yaw_cmd = float(np.arctan2(vy, vx))
+            elif abs(ff_vel[0]) > 0.05 or abs(ff_vel[1]) > 0.05:
+                yaw_cmd = float(np.arctan2(float(ff_vel[1]), float(ff_vel[0])))
             else:
-                svx, svy = float(ref_vel[0]), float(ref_vel[1])
-                yaw_cmd = float(np.arctan2(svy, svx)) if (abs(svx) > 0.05 or abs(svy) > 0.05) else yaw
+                yaw_cmd = yaw
             return [float(sp[0]), float(sp[1]), float(sp[2]), yaw_cmd]
 
         if self._nav_state == self._S_APPROACH and self._gate_d_hat is not None:
