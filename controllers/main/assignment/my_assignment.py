@@ -97,7 +97,7 @@ LAP_SEARCH_AHEAD = LAP_SEG_T * 1.5  # s of spline to search when projecting dron
 LAP_A_MAX            = 2.0   # m/s^2 - max centripetal/longitudinal accel for velocity profile
 LAP_V_MAX            = 2.0   # m/s - speed cap; matched to PID L_vel_xy limit
 LAP_V_MIN            = 0.8   # m/s - speed floor even in the tightest turns
-LAP_LOOKAHEAD_REAL_T = 1.30  # s - real-flight-time lookahead horizon; scales with speed
+LAP_LOOKAHEAD_REAL_T = 1.0  # s - real-flight-time lookahead horizon; scales with speed
 
 
 # ---------------------------------------------------------------------------
@@ -630,9 +630,7 @@ class MyAssignment:
             ref_pos = self._lap_spline(t_ref)
 
             # 4. Feed-forward velocity: spline tangent at the lookahead point,
-            #    scaled to the target real-world speed.  ref_vel from the spline
-            #    is in spline-time units (m/spline-s), not m/s, so we normalise
-            #    it and multiply by v_target to get the correct m/s vector.
+            #    scaled to the target real-world speed.
             ref_vel_spline = self._lap_spline_vel(t_ref)
             ref_speed      = float(np.linalg.norm(ref_vel_spline))
             if ref_speed > 0.05:
