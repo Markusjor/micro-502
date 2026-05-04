@@ -60,9 +60,9 @@ class quadrotor_controller():
             self.limits = {
                         "L_rate_rp": 2.0,
                         "L_rate_y": 3.0,
-                        "L_acc_rp": np.pi/6,
+                        "L_acc_rp": np.pi/5,
                         "L_vel_z": 0.75,
-                        "L_vel_xy": 2.0
+                        "L_vel_xy": 2.2
                         }
             ### END EXERCISE 1 SOLUTION ###
                 
