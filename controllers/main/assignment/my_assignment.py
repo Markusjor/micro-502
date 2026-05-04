@@ -89,15 +89,15 @@ SIDE_STEP_TOL    = 0.20   # m - 2-D arrival radius per waypoint
 SIDE_STEP_DUR    = 1.2    # s - polynomial duration per waypoint segment
 # Lap spline (laps 2 and 3): periodic CubicSpline through the 5 gate centres.
 LAP_SEG_T        = 2.0    # s per gate-to-gate spline segment (spline parameterisation only)
-LAP_SPEED        = 1.5    # m/s fallback speed (used when velocity profile is unavailable)
+LAP_SPEED        = 1.8    # m/s fallback speed (used when velocity profile is unavailable)
 LAP_LOOKAHEAD_T  = 2.0    # s of spline ahead - fallback when velocity profile is unavailable
 LAP_POLY_MIN_T   = 0.15   # minimum polynomial duration for lap replans
 LAP_SEARCH_AHEAD = LAP_SEG_T * 1.5  # s of spline to search when projecting drone position
 # Curvature-adaptive velocity profile
-LAP_A_MAX            = 2.0   # m/s^2 - max centripetal/longitudinal accel for velocity profile
-LAP_V_MAX            = 2.0   # m/s - speed cap; matched to PID L_vel_xy limit
+LAP_A_MAX            = 2.2   # m/s^2 - max centripetal/longitudinal accel for velocity profile
+LAP_V_MAX            = 2.2   # m/s - speed cap; matched to PID L_vel_xy limit
 LAP_V_MIN            = 0.8   # m/s - speed floor even in the tightest turns
-LAP_LOOKAHEAD_REAL_T = 1.0  # s - real-flight-time lookahead horizon; scales with speed
+LAP_LOOKAHEAD_REAL_T = 1.15  # s - real-flight-time lookahead horizon; scales with speed
 
 
 # ---------------------------------------------------------------------------
